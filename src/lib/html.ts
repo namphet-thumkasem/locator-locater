@@ -21,6 +21,11 @@ const RESOURCE_ATTRIBUTES = new Set([
 
 export const DEFAULT_TEST_ID_ATTRIBUTES = ["data-testid", "data-test", "data-cy", "data-qa"];
 const SENSITIVE_VALUE_PATTERN = /(password|token|secret|api[-_]?key|auth|session|csrf|credential)/i;
+const EMPTY_HTML_ELEMENT_SIZE = "24px";
+
+type SnapshotOptions = {
+  inflateEmptyHtmlElements?: boolean;
+};
 
 export function parseWorkbenchInput(rawValue: string): ParseResult {
   const value = rawValue.trim();
@@ -65,13 +70,16 @@ export function parseWorkbenchInput(rawValue: string): ParseResult {
   }
 }
 
-export function createPageSnapshot(html: string): SnapshotResult {
+export function createPageSnapshot(html: string, options: SnapshotOptions = {}): SnapshotResult {
   const parser = new DOMParser();
   const document = parser.parseFromString(html, "text/html");
   const warnings = new Set<string>();
 
   removeDangerousElements(document, warnings);
   sanitizeElements(document, warnings);
+  if (options.inflateEmptyHtmlElements) {
+    inflateEmptyHtmlElements(document, warnings);
+  }
   assignLocatorIds(document);
   injectPreviewStyles(document);
 
@@ -214,6 +222,42 @@ function sanitizeCss(value: string): string {
     .replace(/javascript:/gi, "");
 }
 
+function inflateEmptyHtmlElements(document: Document, warnings: Set<string>) {
+  let inflated = 0;
+
+  for (const element of Array.from(document.body.querySelectorAll("div"))) {
+    if (!isEmptyHtmlElement(element)) continue;
+
+    const style = element.getAttribute("style") ?? "";
+    const nextStyle = [
+      style.trim().replace(/;?$/, ""),
+      hasCssDeclaration(style, "min-width") || hasCssDeclaration(style, "width") ? "" : `min-width: ${EMPTY_HTML_ELEMENT_SIZE}`,
+      hasCssDeclaration(style, "min-height") || hasCssDeclaration(style, "height") ? "" : `min-height: ${EMPTY_HTML_ELEMENT_SIZE}`
+    ]
+      .filter(Boolean)
+      .join("; ");
+
+    element.setAttribute("style", nextStyle);
+    element.setAttribute("data-locator-empty-box", "true");
+    inflated += 1;
+  }
+
+  if (inflated > 0) {
+    warnings.add(`Expanded ${inflated} empty HTML div${inflated === 1 ? "" : "s"} for preview targeting.`);
+  }
+}
+
+function isEmptyHtmlElement(element: Element) {
+  if (normalizeText(element.textContent ?? "")) return false;
+  if (element.children.length > 0) return false;
+  if (element.querySelector("img, svg, canvas, input, textarea, select, button, video, audio, iframe")) return false;
+  return true;
+}
+
+function hasCssDeclaration(style: string, property: string) {
+  return new RegExp(`(^|;)\\s*${property}\\s*:`, "i").test(style);
+}
+
 function assignLocatorIds(document: Document) {
   let index = 1;
   for (const element of Array.from(document.body.querySelectorAll("*"))) {
@@ -239,6 +283,11 @@ function injectPreviewStyles(document: Document) {
       outline: 3px solid #2563eb !important;
       outline-offset: 5px !important;
       box-shadow: 0 0 0 8px rgba(37, 99, 235, 0.18) !important;
+    }
+    [data-locator-empty-box="true"] {
+      background:
+        linear-gradient(135deg, rgba(15, 118, 110, 0.12), rgba(217, 119, 6, 0.12)) !important;
+      border: 1px dashed rgba(15, 118, 110, 0.55) !important;
     }
   `;
   document.head.appendChild(style);

@@ -71,4 +71,25 @@ describe("snapshot sanitization", () => {
     expect(style?.textContent).toContain("color: red");
     expect(style?.textContent).not.toContain("url(");
   });
+
+  it("can inflate empty HTML divs so zero-size boxes stay targetable in preview", () => {
+    const snapshot = createPageSnapshot("<main><div id=\"empty-target\"></div><div>Content</div></main>", {
+      inflateEmptyHtmlElements: true
+    });
+    const document = documentFromSnapshot(snapshot.html);
+    const emptyTarget = document.querySelector("#empty-target");
+
+    expect(emptyTarget?.getAttribute("data-locator-empty-box")).toBe("true");
+    expect(emptyTarget?.getAttribute("style")).toContain("min-width: 24px");
+    expect(emptyTarget?.getAttribute("style")).toContain("min-height: 24px");
+    expect(snapshot.warnings).toContain("Expanded 1 empty HTML div for preview targeting.");
+    expect(document.querySelector("div:not(#empty-target)")?.getAttribute("data-locator-empty-box")).toBeNull();
+  });
+
+  it("does not inflate empty divs unless requested", () => {
+    const snapshot = createPageSnapshot("<div id=\"empty-target\"></div>");
+    const document = documentFromSnapshot(snapshot.html);
+
+    expect(document.querySelector("#empty-target")?.getAttribute("data-locator-empty-box")).toBeNull();
+  });
 });

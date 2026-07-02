@@ -234,7 +234,9 @@ export function LocatorWorkbench() {
       return;
     }
 
-    const nextSnapshot = createPageSnapshot(parsed.source.html);
+    const nextSnapshot = createPageSnapshot(parsed.source.html, {
+      inflateEmptyHtmlElements: parsed.source.kind === "html"
+    });
     setError("");
     setSource(parsed.source);
     setSnapshot(nextSnapshot);
