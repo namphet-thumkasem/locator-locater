@@ -33,6 +33,11 @@ type RenderPageOptions = {
   dismissOverlays: boolean;
 };
 type RenderPage = (url: string, options: RenderPageOptions) => Promise<RenderedPage>;
+type CaptureMetrics = {
+  visibleTextLength: number;
+  visibleControlCount: number;
+  bodyElementCount: number;
+};
 type IngestUrlOptions = {
   dismissOverlays?: boolean;
   fetchLike?: FetchLike;
@@ -360,7 +365,25 @@ async function renderUrlWithBrowser(url: string, options: RenderPageOptions): Pr
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: RENDER_TIMEOUT_MS });
     await page.waitForLoadState("networkidle", { timeout: 4_000 }).catch(() => undefined);
     await page.waitForTimeout(RENDER_SETTLE_MS);
+    const beforeCleanup = {
+      html: await page.content(),
+      url: page.url(),
+      title: await page.title(),
+      metrics: await captureMetrics(page)
+    };
     const overlayActions = options.dismissOverlays ? await dismissBlockingOverlays(page) : [];
+    const afterCleanupMetrics = options.dismissOverlays && overlayActions.length ? await captureMetrics(page) : beforeCleanup.metrics;
+
+    if (options.dismissOverlays && overlayActions.length && cleanupBlankedPage(beforeCleanup.metrics, afterCleanupMetrics)) {
+      return {
+        html: beforeCleanup.html,
+        url: beforeCleanup.url,
+        title: beforeCleanup.title,
+        overlayActions: ["Skipped overlay cleanup because it hid most visible page content."],
+        viewport
+      };
+    }
+
     await page.evaluate(() => {
       document.querySelectorAll("[data-locator-capture-action]").forEach((element) => {
         element.removeAttribute("data-locator-capture-action");
@@ -377,6 +400,40 @@ async function renderUrlWithBrowser(url: string, options: RenderPageOptions): Pr
   } finally {
     await browser.close();
   }
+}
+
+async function captureMetrics(page: Page): Promise<CaptureMetrics> {
+  return page.evaluate(() => {
+    const visibleElements = Array.from(document.body.querySelectorAll<HTMLElement>("body *")).filter((element) => {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 1 && rect.height > 1 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity || "1") > 0.05;
+    });
+    const visibleText = visibleElements
+      .map((element) => element.innerText || element.textContent || "")
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const visibleControlCount = visibleElements.filter((element) => {
+      return element.matches("button, a[href], input, textarea, select, [role='button'], [role='link'], [tabindex]");
+    }).length;
+
+    return {
+      visibleTextLength: visibleText.length,
+      visibleControlCount,
+      bodyElementCount: document.body.querySelectorAll("*").length
+    };
+  }).catch(() => ({ visibleTextLength: 0, visibleControlCount: 0, bodyElementCount: 0 }));
+}
+
+function cleanupBlankedPage(before: CaptureMetrics, after: CaptureMetrics) {
+  if (before.visibleTextLength < 40 && before.visibleControlCount < 1) return false;
+
+  const lostMostText = after.visibleTextLength < Math.max(20, before.visibleTextLength * 0.25);
+  const lostControls = before.visibleControlCount > 0 && after.visibleControlCount === 0;
+  const lostDom = before.bodyElementCount > 10 && after.bodyElementCount < before.bodyElementCount * 0.25;
+
+  return lostMostText || (lostControls && after.visibleTextLength < 40) || lostDom;
 }
 
 async function launchChromium(): Promise<Browser> {
@@ -404,7 +461,9 @@ async function dismissBlockingOverlays(page: Page): Promise<string[]> {
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const action = await page.evaluate((actionIndex) => {
       const dismissTextPattern =
-        /(accept all|accept|agree|allow all|got it|ok|close|dismiss|continue|ยอมรับ|ตกลง|ปิด|รับทราบ|อนุญาต)/i;
+        /(accept all|accept|agree|allow all|got it|close|dismiss|ยอมรับ|ปิด|รับทราบ|อนุญาต)/i;
+      const genericDismissTextPattern = /^(ok|ตกลง)$/i;
+      const overlayContextPattern = /(cookie|privacy|consent|modal|popup|newsletter|subscribe|notification|คุกกี้|ความเป็นส่วนตัว|นโยบาย)/i;
       const controls = Array.from(
         document.querySelectorAll<HTMLElement>(
           [
@@ -443,13 +502,16 @@ async function dismissBlockingOverlays(page: Page): Promise<string[]> {
         .map((item) => {
           const fixedAncestor = closestBlockingAncestor(item.element);
           const isDismissText = dismissTextPattern.test(item.text);
+          const overlayContext = overlayContextText(item.element, fixedAncestor);
+          const isGenericDismissText = genericDismissTextPattern.test(item.text.trim()) && overlayContextPattern.test(overlayContext);
           const rect = fixedAncestor?.getBoundingClientRect() ?? item.rect;
           const areaRatio = (rect.width * rect.height) / Math.max(1, window.innerWidth * window.innerHeight);
           let score = 0;
           if (isDismissText) score += 30;
+          if (isGenericDismissText) score += 24;
           if (fixedAncestor) score += 20;
           if (areaRatio > 0.12) score += 10;
-          if (/accept all|ยอมรับ|ตกลง/i.test(item.text)) score += 6;
+          if (/accept all|ยอมรับ/i.test(item.text)) score += 6;
           if (/close|dismiss|ปิด/i.test(item.text)) score += 4;
           return { ...item, score };
         })
@@ -478,6 +540,24 @@ async function dismissBlockingOverlays(page: Page): Promise<string[]> {
           current = current.parentElement;
         }
         return null;
+      }
+
+      function overlayContextText(element: HTMLElement, ancestor: HTMLElement | null): string {
+        return [
+          element.id,
+          element.className,
+          element.getAttribute("aria-label"),
+          element.getAttribute("title"),
+          ancestor?.id,
+          ancestor?.className,
+          ancestor?.getAttribute("aria-label"),
+          ancestor?.getAttribute("role"),
+          ancestor?.textContent
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .replace(/\s+/g, " ")
+          .slice(0, 1000);
       }
     }, attempt);
 
