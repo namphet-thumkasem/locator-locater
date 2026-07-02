@@ -86,10 +86,25 @@ describe("snapshot sanitization", () => {
     expect(document.querySelector("div:not(#empty-target)")?.getAttribute("data-locator-empty-box")).toBeNull();
   });
 
+  it("highlights SVGs in HTML mode so white icons have preview contrast", () => {
+    const snapshot = createPageSnapshot(
+      '<svg id="white-icon" viewBox="0 0 24 24"><path fill="#fff" d="M4 4h16v16H4z" /></svg>',
+      { inflateEmptyHtmlElements: true }
+    );
+    const document = documentFromSnapshot(snapshot.html);
+    const svg = document.querySelector("#white-icon");
+
+    expect(svg?.getAttribute("data-locator-svg-box")).toBe("true");
+    expect(svg?.getAttribute("style")).toContain("min-width: 32px");
+    expect(svg?.getAttribute("style")).toContain("min-height: 32px");
+    expect(snapshot.warnings).toContain("Highlighted 1 HTML SVG for preview contrast.");
+  });
+
   it("does not inflate empty divs unless requested", () => {
-    const snapshot = createPageSnapshot("<div id=\"empty-target\"></div>");
+    const snapshot = createPageSnapshot("<div id=\"empty-target\"></div><svg id=\"plain-svg\"></svg>");
     const document = documentFromSnapshot(snapshot.html);
 
     expect(document.querySelector("#empty-target")?.getAttribute("data-locator-empty-box")).toBeNull();
+    expect(document.querySelector("#plain-svg")?.getAttribute("data-locator-svg-box")).toBeNull();
   });
 });

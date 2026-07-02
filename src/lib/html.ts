@@ -22,6 +22,7 @@ const RESOURCE_ATTRIBUTES = new Set([
 export const DEFAULT_TEST_ID_ATTRIBUTES = ["data-testid", "data-test", "data-cy", "data-qa"];
 const SENSITIVE_VALUE_PATTERN = /(password|token|secret|api[-_]?key|auth|session|csrf|credential)/i;
 const EMPTY_HTML_ELEMENT_SIZE = "24px";
+const SVG_HTML_ELEMENT_SIZE = "32px";
 
 type SnapshotOptions = {
   inflateEmptyHtmlElements?: boolean;
@@ -78,7 +79,7 @@ export function createPageSnapshot(html: string, options: SnapshotOptions = {}):
   removeDangerousElements(document, warnings);
   sanitizeElements(document, warnings);
   if (options.inflateEmptyHtmlElements) {
-    inflateEmptyHtmlElements(document, warnings);
+    inflateHtmlPreviewTargets(document, warnings);
   }
   assignLocatorIds(document);
   injectPreviewStyles(document);
@@ -222,9 +223,21 @@ function sanitizeCss(value: string): string {
     .replace(/javascript:/gi, "");
 }
 
-function inflateEmptyHtmlElements(document: Document, warnings: Set<string>) {
-  let inflated = 0;
+function inflateHtmlPreviewTargets(document: Document, warnings: Set<string>) {
+  const inflatedDivs = inflateEmptyDivs(document);
+  const highlightedSvgs = highlightSvgPreviewTargets(document);
 
+  if (inflatedDivs > 0) {
+    warnings.add(`Expanded ${inflatedDivs} empty HTML div${inflatedDivs === 1 ? "" : "s"} for preview targeting.`);
+  }
+
+  if (highlightedSvgs > 0) {
+    warnings.add(`Highlighted ${highlightedSvgs} HTML SVG${highlightedSvgs === 1 ? "" : "s"} for preview contrast.`);
+  }
+}
+
+function inflateEmptyDivs(document: Document) {
+  let inflated = 0;
   for (const element of Array.from(document.body.querySelectorAll("div"))) {
     if (!isEmptyHtmlElement(element)) continue;
 
@@ -242,9 +255,32 @@ function inflateEmptyHtmlElements(document: Document, warnings: Set<string>) {
     inflated += 1;
   }
 
-  if (inflated > 0) {
-    warnings.add(`Expanded ${inflated} empty HTML div${inflated === 1 ? "" : "s"} for preview targeting.`);
+  return inflated;
+}
+
+function highlightSvgPreviewTargets(document: Document) {
+  let highlighted = 0;
+
+  for (const element of Array.from(document.body.querySelectorAll("svg"))) {
+    const style = element.getAttribute("style") ?? "";
+    const nextStyle = [
+      style.trim().replace(/;?$/, ""),
+      hasCssDeclaration(style, "min-width") || hasCssDeclaration(style, "width") || element.hasAttribute("width")
+        ? ""
+        : `min-width: ${SVG_HTML_ELEMENT_SIZE}`,
+      hasCssDeclaration(style, "min-height") || hasCssDeclaration(style, "height") || element.hasAttribute("height")
+        ? ""
+        : `min-height: ${SVG_HTML_ELEMENT_SIZE}`
+    ]
+      .filter(Boolean)
+      .join("; ");
+
+    if (nextStyle) element.setAttribute("style", nextStyle);
+    element.setAttribute("data-locator-svg-box", "true");
+    highlighted += 1;
   }
+
+  return highlighted;
 }
 
 function isEmptyHtmlElement(element: Element) {
@@ -288,6 +324,17 @@ function injectPreviewStyles(document: Document) {
       background:
         linear-gradient(135deg, rgba(15, 118, 110, 0.12), rgba(217, 119, 6, 0.12)) !important;
       border: 1px dashed rgba(15, 118, 110, 0.55) !important;
+    }
+    [data-locator-svg-box="true"] {
+      background:
+        linear-gradient(45deg, rgba(15, 118, 110, 0.22) 25%, transparent 25%),
+        linear-gradient(-45deg, rgba(15, 118, 110, 0.22) 25%, transparent 25%),
+        linear-gradient(45deg, transparent 75%, rgba(217, 119, 6, 0.18) 75%),
+        linear-gradient(-45deg, transparent 75%, rgba(217, 119, 6, 0.18) 75%) !important;
+      background-color: rgba(15, 118, 110, 0.1) !important;
+      background-position: 0 0, 0 6px, 6px -6px, -6px 0 !important;
+      background-size: 12px 12px !important;
+      border: 1px solid rgba(15, 118, 110, 0.72) !important;
     }
   `;
   document.head.appendChild(style);
