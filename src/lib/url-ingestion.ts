@@ -1,5 +1,5 @@
 import type { RenderedHtmlBundle } from "./types";
-import type { Page } from "playwright";
+import type { Browser, Page } from "playwright-core";
 
 const MAX_HTML_BYTES = 1_500_000;
 const MAX_STYLESHEET_BYTES = 500_000;
@@ -348,8 +348,7 @@ function sourceHtmlWarnings(stylesheets: StylesheetInliningResult, scriptsDetect
 }
 
 async function renderUrlWithBrowser(url: string, options: RenderPageOptions): Promise<RenderedPage> {
-  const { chromium } = await import("playwright");
-  const browser = await chromium.launch({ headless: true });
+  const browser = await launchChromium();
 
   try {
     const viewport = { width: 1440, height: 900 };
@@ -378,6 +377,25 @@ async function renderUrlWithBrowser(url: string, options: RenderPageOptions): Pr
   } finally {
     await browser.close();
   }
+}
+
+async function launchChromium(): Promise<Browser> {
+  const { chromium: playwrightChromium } = await import("playwright-core");
+
+  if (!isServerlessRuntime()) {
+    return playwrightChromium.launch({ headless: true });
+  }
+
+  const chromium = (await import("@sparticuz/chromium")).default;
+  return playwrightChromium.launch({
+    args: chromium.args,
+    executablePath: await chromium.executablePath(),
+    headless: true
+  });
+}
+
+function isServerlessRuntime() {
+  return Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.AWS_REGION);
 }
 
 async function dismissBlockingOverlays(page: Page): Promise<string[]> {
@@ -520,7 +538,7 @@ async function dismissBlockingOverlays(page: Page): Promise<string[]> {
 function renderErrorMessage(error: unknown): string {
   if (!(error instanceof Error)) return "Could not render that URL.";
   if (/Executable doesn't exist|browserType.launch/i.test(error.message)) {
-    return "Could not start Chromium for rendered URL capture. Run `npx playwright install chromium` and try again.";
+    return "Could not start Chromium for rendered URL capture. Locally, run `npx playwright install chromium`; on Vercel, redeploy with `@sparticuz/chromium` installed.";
   }
   return `Could not render that URL: ${error.message}`;
 }

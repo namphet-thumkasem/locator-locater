@@ -146,4 +146,19 @@ describe("URL ingestion", () => {
 
     expect(result).toEqual({ ok: false, status: 413, message: "Fetched page is too large for the workbench." });
   });
+
+  it("reports Chromium launch failures with local and Vercel recovery guidance", async () => {
+    const renderPage = vi.fn(async () => {
+      throw new Error("Executable doesn't exist at /tmp/chromium");
+    });
+
+    const result = await ingestUrl("https://example.test/dashboard", { renderPage });
+
+    expect(result).toEqual({
+      ok: false,
+      status: 502,
+      message:
+        "Could not start Chromium for rendered URL capture. Locally, run `npx playwright install chromium`; on Vercel, redeploy with `@sparticuz/chromium` installed."
+    });
+  });
 });
