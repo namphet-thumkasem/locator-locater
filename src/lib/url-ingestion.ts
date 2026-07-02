@@ -1,5 +1,5 @@
 import type { RenderedHtmlBundle } from "./types";
-import type { Browser, Page } from "playwright-core";
+import type { Browser, BrowserContext, Page, Route } from "playwright-core";
 
 const MAX_HTML_BYTES = 1_500_000;
 const MAX_STYLESHEET_BYTES = 500_000;
@@ -8,6 +8,9 @@ const FETCH_TIMEOUT_MS = 12_000;
 const RENDER_TIMEOUT_MS = 18_000;
 const RENDER_SETTLE_MS = 1_000;
 const OVERLAY_SETTLE_MS = 600;
+const BLOCKED_RESOURCE_TYPES = new Set(["image", "media", "font"]);
+const BLOCKED_RESOURCE_HOST_PATTERN =
+  /(^|\.)((doubleclick|googletagmanager|google-analytics|googleadservices|facebook|facebook\.com|connect\.facebook|hotjar|clarity|criteo|taboola|outbrain|scorecardresearch|adsrvr)\.)/i;
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 type StylesheetInliningResult = {
@@ -359,46 +362,96 @@ async function renderUrlWithBrowser(url: string, options: RenderPageOptions): Pr
     const viewport = { width: 1440, height: 900 };
     const context = await browser.newContext({
       viewport,
+      serviceWorkers: "block",
       userAgent: "LocatorWorkbench/0.1"
     });
-    const page = await context.newPage();
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: RENDER_TIMEOUT_MS });
-    await page.waitForLoadState("networkidle", { timeout: 4_000 }).catch(() => undefined);
-    await page.waitForTimeout(RENDER_SETTLE_MS);
-    const beforeCleanup = {
-      html: await page.content(),
-      url: page.url(),
-      title: await page.title(),
-      metrics: await captureMetrics(page)
-    };
-    const overlayActions = options.dismissOverlays ? await dismissBlockingOverlays(page) : [];
-    const afterCleanupMetrics = options.dismissOverlays && overlayActions.length ? await captureMetrics(page) : beforeCleanup.metrics;
-
-    if (options.dismissOverlays && overlayActions.length && cleanupBlankedPage(beforeCleanup.metrics, afterCleanupMetrics)) {
-      return {
-        html: beforeCleanup.html,
-        url: beforeCleanup.url,
-        title: beforeCleanup.title,
-        overlayActions: ["Skipped overlay cleanup because it hid most visible page content."],
-        viewport
-      };
+    try {
+      return await capturePage(context, url, options, viewport);
+    } finally {
+      await context.close().catch(() => undefined);
     }
-
-    await page.evaluate(() => {
-      document.querySelectorAll("[data-locator-capture-action]").forEach((element) => {
-        element.removeAttribute("data-locator-capture-action");
-      });
-    }).catch(() => undefined);
-
-    return {
-      html: await page.content(),
-      url: page.url(),
-      title: await page.title(),
-      overlayActions,
-      viewport
-    };
   } finally {
     await browser.close();
+  }
+}
+
+async function capturePage(
+  context: BrowserContext,
+  url: string,
+  options: RenderPageOptions,
+  viewport: NonNullable<RenderedPage["viewport"]>
+): Promise<RenderedPage> {
+  const blockedResources = await blockHeavyResources(context);
+  const page = await context.newPage();
+  await page.goto(url, { waitUntil: "commit", timeout: RENDER_TIMEOUT_MS });
+  await page.waitForLoadState("domcontentloaded", { timeout: 8_000 }).catch(() => undefined);
+  await page.waitForLoadState("networkidle", { timeout: 2_500 }).catch(() => undefined);
+  await page.waitForTimeout(RENDER_SETTLE_MS);
+  const beforeCleanup = {
+    html: await page.content(),
+    url: page.url(),
+    title: await page.title(),
+    metrics: await captureMetrics(page)
+  };
+  const overlayActions = options.dismissOverlays ? await dismissBlockingOverlays(page) : [];
+  const afterCleanupMetrics = options.dismissOverlays && overlayActions.length ? await captureMetrics(page) : beforeCleanup.metrics;
+  const resourceAction = blockedResources.count
+    ? `Skipped ${blockedResources.count} heavy asset request${blockedResources.count === 1 ? "" : "s"} during capture`
+    : null;
+
+  if (options.dismissOverlays && overlayActions.length && cleanupBlankedPage(beforeCleanup.metrics, afterCleanupMetrics)) {
+    return {
+      html: beforeCleanup.html,
+      url: beforeCleanup.url,
+      title: beforeCleanup.title,
+      overlayActions: [
+        ...(resourceAction ? [resourceAction] : []),
+        "Skipped overlay cleanup because it hid most visible page content."
+      ],
+      viewport
+    };
+  }
+
+  await page.evaluate(() => {
+    document.querySelectorAll("[data-locator-capture-action]").forEach((element) => {
+      element.removeAttribute("data-locator-capture-action");
+    });
+  }).catch(() => undefined);
+
+  return {
+    html: await page.content(),
+    url: page.url(),
+    title: await page.title(),
+    overlayActions: resourceAction ? [resourceAction, ...overlayActions] : overlayActions,
+    viewport
+  };
+}
+
+async function blockHeavyResources(context: BrowserContext) {
+  const state = { count: 0 };
+  await context.route("**/*", async (route) => {
+    if (shouldBlockRequest(route)) {
+      state.count += 1;
+      await route.abort("blockedbyclient").catch(() => undefined);
+      return;
+    }
+
+    await route.continue().catch(() => undefined);
+  });
+  return state;
+}
+
+function shouldBlockRequest(route: Route) {
+  const request = route.request();
+  const resourceType = request.resourceType();
+  if (BLOCKED_RESOURCE_TYPES.has(resourceType)) return true;
+  if (resourceType === "document" || resourceType === "xhr" || resourceType === "fetch") return false;
+
+  try {
+    const hostname = new URL(request.url()).hostname;
+    return BLOCKED_RESOURCE_HOST_PATTERN.test(hostname);
+  } catch {
+    return false;
   }
 }
 
