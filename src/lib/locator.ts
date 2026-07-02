@@ -96,13 +96,18 @@ export function summarizeElement(element: Element): ElementSummary {
   };
 }
 
-export function generateLocatorCandidates(document: Document, target: Element): LocatorCandidate[] {
+export function generateLocatorCandidates(
+  document: Document,
+  target: Element,
+  options: { testIdAttributes?: string[] } = {}
+): LocatorCandidate[] {
+  const configuredTestIdAttributes = testIdAttributes(options.testIdAttributes);
   const allCandidates = [
-    ...testIdCandidates(document, target),
+    ...testIdCandidates(document, target, configuredTestIdAttributes),
     ...roleCandidates(document, target),
     ...labelCandidates(document, target),
     ...textCandidates(document, target),
-    ...compoundCandidates(document, target),
+    ...compoundCandidates(document, target, configuredTestIdAttributes),
     ...cssCandidates(document, target),
     ...xpathCandidates(document, target)
   ];
@@ -121,6 +126,111 @@ export function generateLocatorCandidates(document: Document, target: Element): 
 
 export function findByLocatorId(document: Document, locatorId: string): Element | null {
   return document.querySelector(`[data-locator-id="${cssEscape(locatorId)}"]`);
+}
+
+export function validateLocatorCandidate(document: Document, candidate: LocatorCandidate): number {
+  if (candidate.strategy === "testId" || candidate.strategy === "css") {
+    return queryCount(document, candidate.value);
+  }
+
+  if (candidate.strategy === "xpath") {
+    return evaluateXPathCount(document, candidate.value);
+  }
+
+  if (candidate.strategy === "role") {
+    const parsed = parseRoleValue(candidate.value);
+    return Array.from(document.body.querySelectorAll("*")).filter((element) => {
+      if (getSemanticRole(element) !== parsed.role) return false;
+      return parsed.name ? safeAccessibleName(element) === parsed.name : true;
+    }).length;
+  }
+
+  if (candidate.strategy === "label") {
+    return Array.from(document.querySelectorAll("input, textarea, select")).filter(
+      (element) => labelTextFor(document, element) === candidate.value
+    ).length;
+  }
+
+  if (candidate.strategy === "text") {
+    return Array.from(document.body.querySelectorAll("*")).filter(
+      (element) => normalizeText(element.textContent ?? "") === candidate.value
+    ).length;
+  }
+
+  if (candidate.strategy === "compound") {
+    const css = candidate.parts?.css;
+    const text = candidate.parts?.text;
+    if (!css || !text) return 0;
+    try {
+      return Array.from(document.querySelectorAll(css)).filter((element) => {
+        return normalizeText(element.textContent ?? "").includes(text);
+      }).length;
+    } catch {
+      return 0;
+    }
+  }
+
+  return 0;
+}
+
+export function manualLocatorCandidate(
+  document: Document,
+  strategy: Extract<LocatorStrategy, "testId" | "css" | "xpath" | "text">,
+  value: string,
+  options: { testIdAttribute?: string } = {}
+): LocatorCandidate {
+  const trimmed = value.trim();
+  const compoundParts = strategy === "css" ? parseCompoundCssSelector(trimmed) : null;
+  const candidateStrategy = compoundParts ? "compound" : strategy;
+  const candidateValue =
+    strategy === "testId" ? `[${options.testIdAttribute ?? "data-testid"}="${cssEscape(trimmed)}"]` : compoundParts?.value ?? trimmed;
+  const parts: LocatorCandidateParts | undefined = compoundParts
+    ? { css: compoundParts.css, text: compoundParts.text }
+    : strategy === "testId"
+      ? { testIdAttribute: options.testIdAttribute ?? "data-testid", testIdValue: trimmed }
+      : undefined;
+  const candidate: LocatorCandidate = {
+    id: `manual:${candidateStrategy}:${candidateValue}`,
+    strategy: candidateStrategy,
+    label: strategy === "testId" ? `${options.testIdAttribute ?? "data-testid"}=${trimmed}` : trimmed,
+    value: candidateValue,
+    score: 0,
+    unique: false,
+    matchCount: 0,
+    recommended: false,
+    warnings: ["Manual locator candidate."],
+    parts
+  };
+  const matchCount = validateLocatorCandidate(document, candidate);
+  return {
+    ...candidate,
+    unique: matchCount === 1,
+    matchCount,
+    warnings:
+      matchCount === 1
+        ? candidate.warnings
+        : [...candidate.warnings, matchCount === 0 ? "Manual locator did not match the page snapshot." : "Manual locator is not unique in the page snapshot."]
+  };
+}
+
+function parseCompoundCssSelector(value: string): { css: string; text: string; value: string } | null {
+  const match = value.match(/^(.+?)\s+hasText\s+("(?:\\.|[^"\\])*")\s*$/);
+  if (!match) return null;
+
+  const css = match[1].trim();
+  if (!css) return null;
+
+  try {
+    const text = JSON.parse(match[2]) as unknown;
+    if (typeof text !== "string" || !text) return null;
+    return {
+      css,
+      text,
+      value: `${css} hasText ${JSON.stringify(text)}`
+    };
+  } catch {
+    return null;
+  }
 }
 
 function isActionTarget(element: Element): boolean {
@@ -146,8 +256,8 @@ function safeAccessibleName(element: Element): string {
   }
 }
 
-function testIdCandidates(document: Document, target: Element): LocatorCandidate[] {
-  return testIdAttributes().flatMap((attribute) => {
+function testIdCandidates(document: Document, target: Element, configuredTestIdAttributes: string[]): LocatorCandidate[] {
+  return configuredTestIdAttributes.flatMap((attribute) => {
     const value = target.getAttribute(attribute);
     if (!value) return [];
     const selector = `[${attribute}="${cssEscape(value)}"]`;
@@ -220,12 +330,12 @@ function textCandidates(document: Document, target: Element): LocatorCandidate[]
   ];
 }
 
-function compoundCandidates(document: Document, target: Element): LocatorCandidate[] {
+function compoundCandidates(document: Document, target: Element, configuredTestIdAttributes: string[]): LocatorCandidate[] {
   const text = compoundTextFor(target);
   if (!text) return [];
 
   const selectors = [
-    ...testIdAttributes().flatMap((attribute) => {
+    ...configuredTestIdAttributes.flatMap((attribute) => {
       const value = target.getAttribute(attribute);
       return value
         ? [{ css: `[${attribute}="${cssEscape(value)}"]`, baseScore: 86, testIdAttribute: attribute, testIdValue: value }]
@@ -283,7 +393,6 @@ function compoundTextFor(target: Element): string {
 function cssCandidates(document: Document, target: Element): LocatorCandidate[] {
   const selectors = [
     { selector: uniqueIdSelector(target), baseScore: 96 },
-    { selector: attributeSelector(target, "aria-label"), baseScore: 88 },
     { selector: attributeSelector(target, "role"), baseScore: 86 },
     { selector: attributeSelector(target, "aria-describedby"), baseScore: 84 },
     { selector: isNameBearingElement(target) ? attributeSelector(target, "name") : null, baseScore: 82 },
@@ -452,7 +561,6 @@ function scopedCssSelectors(target: Element): Array<{ selector: string; baseScor
 function targetCssDescriptors(target: Element): Array<{ selector: string; baseScore: number }> {
   return [
     { selector: isNameBearingElement(target) ? attributeSelector(target, "name") : null, baseScore: 72 },
-    { selector: attributeSelector(target, "aria-label"), baseScore: 70 },
     { selector: attributeSelector(target, "aria-describedby"), baseScore: 68 },
     { selector: shortClassSelector(target), baseScore: 66 }
   ].filter((entry): entry is { selector: string; baseScore: number } => Boolean(entry.selector));
@@ -506,7 +614,6 @@ function isNameBearingElement(element: Element): boolean {
 
 function meaningfulAttributeSelectors(target: Element): Array<{ selector: string; baseScore: number }> {
   return [
-    { selector: attributeSelector(target, "placeholder"), baseScore: 70 },
     { selector: attributeSelector(target, "title"), baseScore: 68 },
     { selector: attributeSelector(target, "alt"), baseScore: 68 },
     { selector: attributeSelector(target, "type"), baseScore: 62 }
@@ -593,4 +700,10 @@ function evaluateXPathCount(document: Document, xpath: string): number {
   } catch {
     return 0;
   }
+}
+
+function parseRoleValue(value: string): { role: string; name?: string } {
+  const match = value.match(/^([^[]+)\[name="(.+)"\]$/);
+  if (!match) return { role: value };
+  return { role: match[1], name: match[2] };
 }

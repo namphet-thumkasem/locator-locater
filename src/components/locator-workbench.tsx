@@ -2,16 +2,15 @@
 
 import {
   BadgeHelp,
-  Bookmark,
   Check,
   Clipboard,
   Code2,
   Copy,
   FileInput,
   Keyboard,
-  Layers3,
   Link2,
   Monitor,
+  Moon,
   MousePointer2,
   PanelTop,
   RefreshCw,
@@ -20,22 +19,24 @@ import {
   ShieldCheck,
   Smartphone,
   Sun,
-  Trash2
+  Trash2,
+  X
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { bookmarkletCode, formatSnippet } from "@/lib/formatters";
-import { createPageSnapshot, documentFromSnapshot, parseWorkbenchInput } from "@/lib/html";
+import { createPageSnapshot, documentFromSnapshot, parseWorkbenchInput, testIdAttributes } from "@/lib/html";
 import {
   findActionTarget,
   findByLocatorId,
   generateLocatorCandidates,
-  getElementChain,
+  manualLocatorCandidate,
   summarizeElement
 } from "@/lib/locator";
 import type {
   ElementSummary,
   Framework,
   LocatorCandidate,
+  LocatorStrategy,
   RenderedHtmlBundle,
   SnippetMode,
   SnapshotResult,
@@ -43,6 +44,32 @@ import type {
 } from "@/lib/types";
 
 const STORAGE_KEY = "locator-workbench:last-input";
+const SETTINGS_KEY = "locator-workbench:test-id-attributes";
+const THEME_KEY = "locator-workbench:theme";
+const DISMISS_OVERLAYS_KEY = "locator-workbench:dismiss-overlays";
+const DEFAULT_TEST_ID_INPUT = "data-testid, data-test, data-cy, data-qa";
+
+const PREVIEW_VIEWPORTS = [
+  { id: "1440x900", label: "1440 x 900", width: 1440, height: 900, device: "desktop" },
+  { id: "1024x768", label: "1024 x 768", width: 1024, height: 768, device: "tablet" },
+  { id: "768x1024", label: "768 x 1024", width: 768, height: 1024, device: "tablet" },
+  { id: "390x844", label: "390 x 844", width: 390, height: 844, device: "mobile" },
+  { id: "360x740", label: "360 x 740", width: 360, height: 740, device: "mobile" }
+] as const;
+
+const DEVICE_DEFAULT_VIEWPORT: Record<PreviewDevice, PreviewViewportId> = {
+  desktop: "1440x900",
+  tablet: "768x1024",
+  mobile: "390x844"
+};
+
+const PREVIEW_ZOOMS = [
+  { value: "fit", label: "Fit" },
+  { value: "100", label: "100%" },
+  { value: "75", label: "75%" },
+  { value: "50", label: "50%" }
+] as const;
+
 
 const SAMPLE_HTML = `<!doctype html>
 <html>
@@ -81,14 +108,24 @@ const SAMPLE_HTML = `<!doctype html>
 
 type SelectionState = {
   target: ElementSummary;
-  chain: ElementSummary[];
   candidates: LocatorCandidate[];
 };
 
 type SourceMode = "html" | "url";
+type ManualStrategy = Extract<LocatorStrategy, "testId" | "css" | "xpath" | "text">;
+type CopyState = "idle" | "snippet" | "selector" | "all" | "bookmarklet" | "manualSnippet" | "manualSelector";
+type DialogPanel = "shortcuts" | "settings" | "help" | null;
+type PreviewDevice = (typeof PREVIEW_VIEWPORTS)[number]["device"];
+type PreviewViewportId = (typeof PREVIEW_VIEWPORTS)[number]["id"];
+type PreviewZoom = (typeof PREVIEW_ZOOMS)[number]["value"];
+type ThemeMode = "light" | "dark";
 
 export function LocatorWorkbench() {
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const previewFrameRef = useRef<HTMLDivElement | null>(null);
+  const htmlInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const urlInputRef = useRef<HTMLInputElement | null>(null);
+  const settingsInputRef = useRef<HTMLInputElement | null>(null);
   const [sourceMode, setSourceMode] = useState<SourceMode>("html");
   const [input, setInput] = useState(SAMPLE_HTML);
   const [urlInput, setUrlInput] = useState("");
@@ -100,7 +137,42 @@ export function LocatorWorkbench() {
   const [selectedCandidateId, setSelectedCandidateId] = useState("");
   const [framework, setFramework] = useState<Framework>("playwright");
   const [snippetMode, setSnippetMode] = useState<SnippetMode>("action");
-  const [copyState, setCopyState] = useState<"idle" | "copied">("idle");
+  const [copyState, setCopyState] = useState<CopyState>("idle");
+  const [testIdAttributesInput, setTestIdAttributesInput] = useState(DEFAULT_TEST_ID_INPUT);
+  const [manualStrategy, setManualStrategy] = useState<ManualStrategy>("css");
+  const [manualValue, setManualValue] = useState("");
+  const [activeDialog, setActiveDialog] = useState<DialogPanel>(null);
+  const [theme, setTheme] = useState<ThemeMode>("light");
+  const [dismissOverlays, setDismissOverlays] = useState(true);
+  const [previewDevice, setPreviewDevice] = useState<PreviewDevice>("desktop");
+  const [previewViewportId, setPreviewViewportId] = useState<PreviewViewportId>("1440x900");
+  const [previewZoom, setPreviewZoom] = useState<PreviewZoom>("fit");
+  const [previewFitScale, setPreviewFitScale] = useState(1);
+
+  const configuredTestIdAttributes = useMemo(() => {
+    return testIdAttributes(testIdAttributesInput.split(","));
+  }, [testIdAttributesInput]);
+
+  const selectedViewport = useMemo(() => {
+    return PREVIEW_VIEWPORTS.find((viewport) => viewport.id === previewViewportId) ?? PREVIEW_VIEWPORTS[0];
+  }, [previewViewportId]);
+
+  const previewScale = previewZoom === "fit" ? previewFitScale : Number(previewZoom) / 100;
+
+  const previewShellStyle = useMemo(() => {
+    return {
+      width: `${Math.round(selectedViewport.width * previewScale)}px`,
+      height: `${Math.round(selectedViewport.height * previewScale)}px`
+    };
+  }, [previewScale, selectedViewport.height, selectedViewport.width]);
+
+  const previewCanvasStyle = useMemo(() => {
+    return {
+      width: `${selectedViewport.width}px`,
+      height: `${selectedViewport.height}px`,
+      transform: previewScale === 1 ? undefined : `scale(${previewScale})`
+    };
+  }, [previewScale, selectedViewport.height, selectedViewport.width]);
 
   const selectedCandidate = useMemo(() => {
     if (!selection?.candidates.length) return null;
@@ -116,6 +188,25 @@ export function LocatorWorkbench() {
     return formatSnippet(selectedCandidate, selection?.candidates ?? [], framework, snippetMode, selection?.target ?? null);
   }, [framework, selectedCandidate, selection, snippetMode]);
 
+  const manualCandidate = useMemo(() => {
+    if (!snapshot || !manualValue.trim()) return null;
+    const document = documentFromSnapshot(snapshot.html);
+    return manualLocatorCandidate(document, manualStrategy, manualValue, {
+      testIdAttribute: configuredTestIdAttributes[0]
+    });
+  }, [configuredTestIdAttributes, manualStrategy, manualValue, snapshot]);
+
+  const manualSnippet = useMemo(() => {
+    if (!manualCandidate) return null;
+    return formatSnippet(manualCandidate, [manualCandidate, ...(selection?.candidates ?? [])], framework, snippetMode, selection?.target ?? null);
+  }, [framework, manualCandidate, selection, snippetMode]);
+
+  const manualMatchLocatorIds = useMemo(() => {
+    if (!snapshot || !manualCandidate) return [];
+    const document = documentFromSnapshot(snapshot.html);
+    return matchingLocatorIds(document, manualCandidate);
+  }, [manualCandidate, snapshot]);
+
   const selectLocatorId = useCallback(
     (locatorId: string) => {
       if (!snapshot) return;
@@ -123,17 +214,17 @@ export function LocatorWorkbench() {
       const target = findByLocatorId(document, locatorId);
       if (!target) return;
 
-      const chain = getElementChain(target);
-      const candidates = generateLocatorCandidates(document, target);
+      const candidates = generateLocatorCandidates(document, target, {
+        testIdAttributes: configuredTestIdAttributes
+      });
       setSelection({
         target: summarizeElement(target),
-        chain,
         candidates
       });
       setSelectedCandidateId(candidates.find((candidate) => candidate.recommended)?.id ?? candidates[0]?.id ?? "");
       markIframeSelection(locatorId);
     },
-    [snapshot]
+    [configuredTestIdAttributes, snapshot]
   );
 
   const importValue = useCallback((rawValue: string, persist: boolean) => {
@@ -154,9 +245,73 @@ export function LocatorWorkbench() {
 
   useEffect(() => {
     const restoredInput = window.localStorage.getItem(STORAGE_KEY) ?? SAMPLE_HTML;
+    const restoredSettings = window.localStorage.getItem(SETTINGS_KEY) ?? DEFAULT_TEST_ID_INPUT;
+    const restoredTheme = window.localStorage.getItem(THEME_KEY);
+    const restoredDismissOverlays = window.localStorage.getItem(DISMISS_OVERLAYS_KEY);
     setInput(restoredInput);
+    setTestIdAttributesInput(restoredSettings);
+    if (restoredTheme === "dark" || restoredTheme === "light") setTheme(restoredTheme);
+    if (restoredDismissOverlays === "false") setDismissOverlays(false);
     importValue(restoredInput, false);
   }, [importValue]);
+
+  useEffect(() => {
+    window.localStorage.setItem(SETTINGS_KEY, testIdAttributesInput);
+  }, [testIdAttributesInput]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    window.localStorage.setItem(THEME_KEY, theme);
+  }, [theme]);
+
+  useEffect(() => {
+    window.localStorage.setItem(DISMISS_OVERLAYS_KEY, String(dismissOverlays));
+  }, [dismissOverlays]);
+
+  useEffect(() => {
+    if (!selection || !snapshot) return;
+    const document = documentFromSnapshot(snapshot.html);
+    const target = findByLocatorId(document, selection.target.locatorId);
+    if (!target) return;
+    const candidates = generateLocatorCandidates(document, target, {
+      testIdAttributes: configuredTestIdAttributes
+    });
+    setSelection((current) => current && { ...current, candidates });
+    setSelectedCandidateId(candidates.find((candidate) => candidate.recommended)?.id ?? candidates[0]?.id ?? "");
+  }, [configuredTestIdAttributes, snapshot, selection?.target.locatorId]);
+
+  useEffect(() => {
+    markIframeManualMatches(manualMatchLocatorIds);
+  }, [manualMatchLocatorIds]);
+
+  useEffect(() => {
+    const element = previewFrameRef.current;
+    if (!element) return;
+
+    const updateFitScale = () => {
+      const availableWidth = Math.max(1, element.clientWidth - 32);
+      const availableHeight = Math.max(1, element.clientHeight - 32);
+      const nextScale = Math.min(1, availableWidth / selectedViewport.width, availableHeight / selectedViewport.height);
+      const roundedScale = Math.max(0.1, Number(nextScale.toFixed(3)));
+      setPreviewFitScale((current) => (Math.abs(current - roundedScale) > 0.001 ? roundedScale : current));
+    };
+
+    updateFitScale();
+
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", updateFitScale);
+      return () => window.removeEventListener("resize", updateFitScale);
+    }
+
+    const observer = new ResizeObserver(updateFitScale);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [selectedViewport.height, selectedViewport.width]);
+
+  useEffect(() => {
+    if (activeDialog !== "settings") return;
+    window.setTimeout(() => settingsInputRef.current?.focus(), 0);
+  }, [activeDialog]);
 
   const importInput = useCallback(() => {
     importValue(input, true);
@@ -176,7 +331,7 @@ export function LocatorWorkbench() {
       const response = await fetch("/api/ingest-url", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ url })
+        body: JSON.stringify({ url, dismissOverlays })
       });
       const body = (await response.json().catch(() => null)) as Partial<RenderedHtmlBundle> & { message?: string } | null;
 
@@ -193,7 +348,8 @@ export function LocatorWorkbench() {
         url: typeof body.url === "string" ? body.url : url,
         title: typeof body.title === "string" ? body.title : undefined,
         capturedAt: typeof body.capturedAt === "string" ? body.capturedAt : new Date().toISOString(),
-        viewport: body.viewport
+        viewport: body.viewport,
+        ingestion: body.ingestion
       };
       const serialized = JSON.stringify(bundle, null, 2);
       setInput(serialized);
@@ -203,7 +359,7 @@ export function LocatorWorkbench() {
     } finally {
       setIsFetchingUrl(false);
     }
-  }, [importValue, urlInput]);
+  }, [dismissOverlays, importValue, urlInput]);
 
   const refreshSource = useCallback(() => {
     if (sourceMode === "url") {
@@ -213,9 +369,43 @@ export function LocatorWorkbench() {
     importInput();
   }, [importInput, importUrl, sourceMode]);
 
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && activeDialog) {
+        setActiveDialog(null);
+        return;
+      }
+
+      const isCommand = event.metaKey || event.ctrlKey;
+      if (!isCommand) return;
+
+      if (event.key === "Enter") {
+        event.preventDefault();
+        refreshSource();
+        return;
+      }
+
+      if (event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        if (sourceMode === "url") {
+          urlInputRef.current?.focus();
+        } else {
+          htmlInputRef.current?.focus();
+        }
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [activeDialog, refreshSource, sourceMode]);
+
   const attachIframeHandlers = useCallback(() => {
     const frameDocument = iframeRef.current?.contentDocument;
-    if (!frameDocument) return;
+    if (!frameDocument?.documentElement) return false;
+
+    markIframeManualMatches(manualMatchLocatorIds);
+    if (frameDocument.documentElement.dataset.locatorHandlersAttached === "true") return true;
+    frameDocument.documentElement.dataset.locatorHandlersAttached = "true";
 
     frameDocument.addEventListener(
       "click",
@@ -242,19 +432,115 @@ export function LocatorWorkbench() {
       },
       true
     );
-  }, [selectLocatorId]);
+    return true;
+  }, [manualMatchLocatorIds, selectLocatorId]);
+
+  const targetFromPreviewPointer = useCallback((event: React.PointerEvent<HTMLDivElement> | React.MouseEvent<HTMLDivElement>) => {
+    const frameDocument = iframeRef.current?.contentDocument;
+    if (!frameDocument) return null;
+
+    const rect = event.currentTarget.getBoundingClientRect();
+    const scaleX = rect.width / selectedViewport.width;
+    const scaleY = rect.height / selectedViewport.height;
+    const x = (event.clientX - rect.left) / Math.max(scaleX, 0.001);
+    const y = (event.clientY - rect.top) / Math.max(scaleY, 0.001);
+    const element = frameDocument.elementFromPoint(x, y);
+    return element ? findActionTarget(element) : null;
+  }, [selectedViewport.height, selectedViewport.width]);
+
+  const selectPreviewPointerTarget = useCallback((event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const target = targetFromPreviewPointer(event);
+    const locatorId = target?.getAttribute("data-locator-id");
+    if (locatorId) selectLocatorId(locatorId);
+  }, [selectLocatorId, targetFromPreviewPointer]);
+
+  const markPreviewPointerHover = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    const frameDocument = iframeRef.current?.contentDocument;
+    if (!frameDocument) return;
+    const target = targetFromPreviewPointer(event);
+    frameDocument.querySelectorAll("[data-locator-hover]").forEach((element) => {
+      element.removeAttribute("data-locator-hover");
+    });
+    target?.setAttribute("data-locator-hover", "true");
+  }, [targetFromPreviewPointer]);
+
+  const scrollPreviewFrame = useCallback((event: React.WheelEvent<HTMLDivElement>) => {
+    const frameWindow = iframeRef.current?.contentWindow;
+    if (!frameWindow) return;
+
+    event.preventDefault();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const scaleX = rect.width / selectedViewport.width;
+    const scaleY = rect.height / selectedViewport.height;
+    frameWindow.scrollBy({
+      left: event.deltaX / Math.max(scaleX, 0.001),
+      top: event.deltaY / Math.max(scaleY, 0.001),
+      behavior: "auto"
+    });
+  }, [selectedViewport.height, selectedViewport.width]);
+
+  useEffect(() => {
+    if (!snapshot) return;
+    const frame = window.requestAnimationFrame(() => attachIframeHandlers());
+    let attempts = 0;
+    const interval = window.setInterval(() => {
+      attempts += 1;
+      if (attachIframeHandlers() || attempts >= 25) {
+        window.clearInterval(interval);
+      }
+    }, 100);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      window.clearInterval(interval);
+    };
+  }, [attachIframeHandlers, snapshot]);
+
+  const markCopied = (state: CopyState) => {
+    setCopyState(state);
+    window.setTimeout(() => setCopyState("idle"), 1200);
+  };
 
   const copySnippet = async () => {
     if (!snippet) return;
     await copyText(snippet.code);
-    setCopyState("copied");
-    window.setTimeout(() => setCopyState("idle"), 1200);
+    markCopied("snippet");
+  };
+
+  const copySelectedSelector = async () => {
+    if (!selectedCandidate) return;
+    await copyText(selectorTextFor(selectedCandidate));
+    markCopied("selector");
+  };
+
+  const copyAllCandidates = async () => {
+    if (!selection?.candidates.length) return;
+    await copyText(
+      selection.candidates
+        .map((candidate, index) => {
+          const marker = candidate.recommended ? " recommended" : "";
+          return `${index + 1}. ${candidate.strategy}${marker}: ${selectorTextFor(candidate)} (${candidate.unique ? "unique" : `${candidate.matchCount} matches`})`;
+        })
+        .join("\n")
+    );
+    markCopied("all");
+  };
+
+  const copyManualSnippet = async () => {
+    if (!manualSnippet) return;
+    await copyText(manualSnippet.code);
+    markCopied("manualSnippet");
+  };
+
+  const copyManualSelector = async () => {
+    if (!manualCandidate) return;
+    await copyText(selectorTextFor(manualCandidate));
+    markCopied("manualSelector");
   };
 
   const copyBookmarklet = async () => {
     await copyText(bookmarkletCode());
-    setCopyState("copied");
-    window.setTimeout(() => setCopyState("idle"), 1200);
+    markCopied("bookmarklet");
   };
 
   const clearAll = () => {
@@ -264,8 +550,37 @@ export function LocatorWorkbench() {
     setSnapshot(null);
     setSelection(null);
     setSelectedCandidateId("");
+    setManualValue("");
     setError("");
     window.localStorage.removeItem(STORAGE_KEY);
+  };
+
+  const resetToSample = () => {
+    setInput(SAMPLE_HTML);
+    importValue(SAMPLE_HTML, true);
+  };
+
+  const toggleDialog = (dialog: Exclude<DialogPanel, null>) => {
+    setActiveDialog((current) => (current === dialog ? null : dialog));
+  };
+
+  const selectPreviewDevice = (device: PreviewDevice) => {
+    setPreviewDevice(device);
+    setPreviewViewportId(DEVICE_DEFAULT_VIEWPORT[device]);
+  };
+
+  const selectPreviewViewport = (viewportId: PreviewViewportId) => {
+    const viewport = PREVIEW_VIEWPORTS.find((item) => item.id === viewportId);
+    setPreviewViewportId(viewportId);
+    if (viewport) setPreviewDevice(viewport.device);
+  };
+
+  const restoreDefaultSettings = () => {
+    setTestIdAttributesInput(DEFAULT_TEST_ID_INPUT);
+  };
+
+  const toggleTheme = () => {
+    setTheme((current) => (current === "light" ? "dark" : "light"));
   };
 
   return (
@@ -276,28 +591,43 @@ export function LocatorWorkbench() {
             <Code2 size={21} />
           </div>
           <h1>Locator Workbench</h1>
-          <span className="version-pill">v0.1.0</span>
+          <span className="version-pill">MVP-2</span>
         </div>
         <div className="header-actions">
-          <button className="ghost-button" type="button">
+          <button
+            className={activeDialog === "shortcuts" ? "ghost-button active" : "ghost-button"}
+            onClick={() => toggleDialog("shortcuts")}
+            type="button"
+            aria-expanded={activeDialog === "shortcuts"}
+          >
             <Keyboard size={15} />
             Shortcuts
           </button>
-          <button className="ghost-button" type="button">
+          <button
+            className={activeDialog === "settings" ? "ghost-button active" : "ghost-button"}
+            onClick={() => toggleDialog("settings")}
+            type="button"
+            aria-expanded={activeDialog === "settings"}
+          >
             <Settings size={15} />
             Settings
           </button>
-          <button className="ghost-button" type="button">
+          <button
+            className={activeDialog === "help" ? "ghost-button active" : "ghost-button"}
+            onClick={() => toggleDialog("help")}
+            type="button"
+            aria-expanded={activeDialog === "help"}
+          >
             <BadgeHelp size={15} />
             Help
           </button>
           <span className="header-divider" />
-          <button className="icon-button" aria-label="Theme" type="button">
-            <Sun size={17} />
+          <button className="icon-button" aria-label="Toggle theme" onClick={toggleTheme} type="button" title="Toggle theme">
+            {theme === "dark" ? <Sun size={17} /> : <Moon size={17} />}
           </button>
           <span className="sandbox-pill">
             <span />
-            Sandbox: On
+            Snapshot only
           </span>
           <button className="secondary-button compact-button" onClick={clearAll} type="button">
             <Trash2 size={15} />
@@ -305,6 +635,84 @@ export function LocatorWorkbench() {
           </button>
         </div>
       </header>
+
+      {activeDialog ? (
+        <WorkbenchDialog
+          icon={dialogIcon(activeDialog)}
+          title={dialogTitle(activeDialog)}
+          onClose={() => setActiveDialog(null)}
+        >
+          {activeDialog === "shortcuts" ? (
+            <div className="command-list">
+              <button type="button" onClick={refreshSource}>
+                <span>Import or refresh</span>
+                <kbd>Cmd Enter</kbd>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveDialog(null);
+                  if (sourceMode === "url") {
+                    urlInputRef.current?.focus();
+                  } else {
+                    htmlInputRef.current?.focus();
+                  }
+                }}
+              >
+                <span>Focus source</span>
+                <kbd>Cmd K</kbd>
+              </button>
+              <button type="button" onClick={() => setActiveDialog(null)}>
+                <span>Dismiss panel</span>
+                <kbd>Esc</kbd>
+              </button>
+            </div>
+          ) : null}
+
+          {activeDialog === "settings" ? (
+            <div className="dialog-form">
+              <label className="control-label" htmlFor="dialog-test-id-attributes">
+                Test ID attributes
+              </label>
+              <input
+                ref={settingsInputRef}
+                id="dialog-test-id-attributes"
+                className="url-input"
+                value={testIdAttributesInput}
+                onChange={(event) => setTestIdAttributesInput(event.target.value)}
+                spellCheck={false}
+              />
+              <div className="dialog-actions">
+                <button className="secondary-button" onClick={restoreDefaultSettings} type="button">
+                  <RotateCcw size={15} />
+                  Restore
+                </button>
+                <button className="primary-button" onClick={() => setActiveDialog(null)} type="button">
+                  <Check size={15} />
+                  Done
+                </button>
+              </div>
+            </div>
+          ) : null}
+
+          {activeDialog === "help" ? (
+            <div className="help-grid">
+              <div>
+                <strong>Source</strong>
+                <span>Paste HTML or render a URL into a sanitized DOM snapshot.</span>
+              </div>
+              <div>
+                <strong>Preview</strong>
+                <span>Click a visible target to generate ranked locator candidates.</span>
+              </div>
+              <div>
+                <strong>Inspector</strong>
+                <span>Copy snippets, selectors, or test manual locator values.</span>
+              </div>
+            </div>
+          ) : null}
+        </WorkbenchDialog>
+      ) : null}
 
       <section className="workbench-grid" aria-label="Locator workbench">
         <aside className="pane source-pane">
@@ -323,12 +731,13 @@ export function LocatorWorkbench() {
             <>
               <div className="input-header">
                 <span>Paste HTML</span>
-                <button onClick={() => setInput(SAMPLE_HTML)} type="button">
+                <button onClick={resetToSample} type="button">
                   <RotateCcw size={14} />
                   Reset
                 </button>
               </div>
               <textarea
+                ref={htmlInputRef}
                 value={input}
                 onChange={(event) => setInput(event.target.value)}
                 spellCheck={false}
@@ -348,6 +757,7 @@ export function LocatorWorkbench() {
                 </button>
               </div>
               <input
+                ref={urlInputRef}
                 className="url-input"
                 value={urlInput}
                 onChange={(event) => setUrlInput(event.target.value)}
@@ -355,7 +765,15 @@ export function LocatorWorkbench() {
                 spellCheck={false}
                 aria-label="Page URL"
               />
-              <p className="small-copy">Renders the page in Chromium, captures the DOM, then sanitizes the snapshot locally.</p>
+              <p className="small-copy">Renders the page in Chromium, captures the DOM, then imports the sanitized snapshot.</p>
+              <label className="toggle-row">
+                <input
+                  checked={dismissOverlays}
+                  onChange={(event) => setDismissOverlays(event.target.checked)}
+                  type="checkbox"
+                />
+                <span>Auto-dismiss cookie banners, popups, and stale loading masks before capture</span>
+              </label>
             </>
           )}
           {error ? <div className="error-note">{error}</div> : null}
@@ -365,38 +783,30 @@ export function LocatorWorkbench() {
           </button>
 
           <div className="subsection">
+            <SectionTitle icon={<Settings size={16} />} title="Locator Settings" />
+            <label className="control-label" htmlFor="test-id-attributes">
+              Test ID attributes
+            </label>
+            <input
+              id="test-id-attributes"
+              className="url-input"
+              value={testIdAttributesInput}
+              onChange={(event) => setTestIdAttributesInput(event.target.value)}
+              spellCheck={false}
+            />
+            <p className="small-copy">Used when generating test-id candidates. Settings are stored locally with the workbench.</p>
+          </div>
+
+          <div className="subsection">
             <SectionTitle icon={<Clipboard size={16} />} title="Capture Bookmarklet" />
             <p className="small-copy">Copies document HTML plus URL, title, capture time, and viewport.</p>
             <button className="secondary-button full-width" onClick={copyBookmarklet} type="button">
-              <Copy size={16} />
-              Copy bookmarklet
+              {copyState === "bookmarklet" ? <Check size={16} /> : <Copy size={16} />}
+              {copyState === "bookmarklet" ? "Copied" : "Copy bookmarklet"}
             </button>
           </div>
 
           <MetadataPanel source={source} snapshot={snapshot} />
-          <div className="subsection option-list">
-            <div className="mini-heading">Options</div>
-            <label>
-              <input checked readOnly type="checkbox" />
-              Remove scripts
-            </label>
-            <label>
-              <input checked readOnly type="checkbox" />
-              Remove external resources
-            </label>
-            <label>
-              <input readOnly type="checkbox" />
-              Sanitize IDs
-            </label>
-          </div>
-          <div className="subsection encoding-block">
-            <label className="control-label" htmlFor="encoding-select">
-              Encoding
-            </label>
-            <select id="encoding-select" value="utf-8" onChange={() => undefined}>
-              <option value="utf-8">UTF-8</option>
-            </select>
-          </div>
         </aside>
 
         <section className="pane preview-pane">
@@ -409,46 +819,76 @@ export function LocatorWorkbench() {
               <RefreshCw size={16} />
             </button>
             <div className="device-control" aria-label="Preview device">
-              <button className="active" type="button" aria-label="Desktop preview">
+              <button
+                className={previewDevice === "desktop" ? "active" : ""}
+                onClick={() => selectPreviewDevice("desktop")}
+                type="button"
+                aria-label="Desktop preview"
+                aria-pressed={previewDevice === "desktop"}
+              >
                 <Monitor size={16} />
               </button>
-              <button type="button" aria-label="Tablet preview">
+              <button
+                className={previewDevice === "tablet" ? "active" : ""}
+                onClick={() => selectPreviewDevice("tablet")}
+                type="button"
+                aria-label="Tablet preview"
+                aria-pressed={previewDevice === "tablet"}
+              >
                 <PanelTop size={15} />
               </button>
-              <button type="button" aria-label="Mobile preview">
+              <button
+                className={previewDevice === "mobile" ? "active" : ""}
+                onClick={() => selectPreviewDevice("mobile")}
+                type="button"
+                aria-label="Mobile preview"
+                aria-pressed={previewDevice === "mobile"}
+              >
                 <Smartphone size={15} />
               </button>
             </div>
-            <select aria-label="Viewport size" value="1440x900" onChange={() => undefined}>
-              <option value="1440x900">1440 x 900</option>
+            <select
+              aria-label="Viewport size"
+              value={previewViewportId}
+              onChange={(event) => selectPreviewViewport(event.target.value as PreviewViewportId)}
+            >
+              {PREVIEW_VIEWPORTS.map((viewport) => (
+                <option key={viewport.id} value={viewport.id}>
+                  {viewport.label}
+                </option>
+              ))}
             </select>
-            <select aria-label="Preview zoom" value="fit" onChange={() => undefined}>
-              <option value="fit">Fit</option>
+            <select aria-label="Preview zoom" value={previewZoom} onChange={(event) => setPreviewZoom(event.target.value as PreviewZoom)}>
+              {PREVIEW_ZOOMS.map((zoom) => (
+                <option key={zoom.value} value={zoom.value}>
+                  {zoom.label}
+                </option>
+              ))}
             </select>
           </div>
-          <div className="preview-frame-wrap">
+          <div className="preview-frame-wrap" ref={previewFrameRef}>
             {snapshot ? (
-              <iframe
-                ref={iframeRef}
-                title="Snapshot preview"
-                sandbox="allow-same-origin"
-                srcDoc={snapshot.html}
-                onLoad={attachIframeHandlers}
-              />
+              <div className="preview-canvas-shell" style={previewShellStyle}>
+                <div className="preview-canvas" style={previewCanvasStyle}>
+                  <iframe
+                    ref={iframeRef}
+                    title="Snapshot preview"
+                    sandbox="allow-same-origin"
+                    srcDoc={snapshot.html}
+                    onLoad={attachIframeHandlers}
+                  />
+                  <div
+                    className="preview-click-layer"
+                    aria-hidden="true"
+                    onPointerDown={selectPreviewPointerTarget}
+                    onMouseMove={markPreviewPointerHover}
+                    onWheel={scrollPreviewFrame}
+                  />
+                </div>
+              </div>
             ) : (
               <div className="empty-state">Import HTML to render a sanitized snapshot.</div>
             )}
-          </div>
-          <div className="preview-footer">
-            <div className="preview-tabs">
-              <button className="active" type="button">HTML</button>
-              <button type="button">DOM Tree</button>
-              <button type="button">Console</button>
-            </div>
-            <div className="crumb-line">
-              {selection ? selection.chain.slice().reverse().map((item) => item.tagName).join(" › ") : "No target selected"}
-            </div>
-            <span className="footer-status">Sanitized · {snapshot ? "ready" : "waiting"}</span>
           </div>
         </section>
 
@@ -457,7 +897,6 @@ export function LocatorWorkbench() {
           {selection ? (
             <>
               <TargetDetails target={selection.target} />
-              {/* <ElementChain chain={selection.chain} onSelect={selectLocatorId} selectedId={selection.target.locatorId} /> */}
               <CandidateList
                 candidates={selection.candidates}
                 selectedId={selectedCandidate?.id ?? ""}
@@ -468,15 +907,32 @@ export function LocatorWorkbench() {
                 mode={snippetMode}
                 snippet={snippet?.code ?? ""}
                 warning={snippet?.warning}
-                copied={copyState === "copied"}
+                copied={copyState}
                 onFrameworkChange={setFramework}
                 onModeChange={setSnippetMode}
                 onCopy={copySnippet}
+                onCopySelector={copySelectedSelector}
+                onCopyAll={copyAllCandidates}
               />
             </>
           ) : (
             <div className="empty-state compact">Select a button, input, or link in the preview.</div>
           )}
+
+          <ManualLocatorTester
+            strategy={manualStrategy}
+            value={manualValue}
+            candidate={manualCandidate}
+            snippet={manualSnippet?.code ?? ""}
+            snippetWarning={manualSnippet?.warning}
+            copied={copyState}
+            disabled={!snapshot}
+            matchCount={manualMatchLocatorIds.length}
+            onStrategyChange={setManualStrategy}
+            onValueChange={setManualValue}
+            onCopy={copyManualSnippet}
+            onCopySelector={copyManualSelector}
+          />
         </aside>
       </section>
     </main>
@@ -499,6 +955,53 @@ function NumberedTitle({ index, title }: { index: number; title: string }) {
       <h2>{title}</h2>
     </div>
   );
+}
+
+function WorkbenchDialog({
+  icon,
+  title,
+  children,
+  onClose
+}: {
+  icon: React.ReactNode;
+  title: string;
+  children: React.ReactNode;
+  onClose: () => void;
+}) {
+  return (
+    <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <section
+        className="dialog-panel"
+        aria-modal="true"
+        role="dialog"
+        aria-labelledby="workbench-dialog-title"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="dialog-head">
+          <div className="dialog-title">
+            {icon}
+            <h2 id="workbench-dialog-title">{title}</h2>
+          </div>
+          <button className="icon-button" aria-label="Close dialog" onClick={onClose} type="button">
+            <X size={16} />
+          </button>
+        </div>
+        {children}
+      </section>
+    </div>
+  );
+}
+
+function dialogTitle(dialog: Exclude<DialogPanel, null>) {
+  if (dialog === "shortcuts") return "Shortcuts";
+  if (dialog === "settings") return "Settings";
+  return "Help";
+}
+
+function dialogIcon(dialog: Exclude<DialogPanel, null>) {
+  if (dialog === "shortcuts") return <Keyboard size={17} />;
+  if (dialog === "settings") return <Settings size={17} />;
+  return <BadgeHelp size={17} />;
 }
 
 function MetadataPanel({ source, snapshot }: { source: WorkbenchSource | null; snapshot: SnapshotResult | null }) {
@@ -533,6 +1036,14 @@ function MetadataPanel({ source, snapshot }: { source: WorkbenchSource | null; s
             <span>Scripts</span>
             <strong>
               {source.metadata.ingestion.scriptsDetected} captured, stripped in preview
+            </strong>
+          </div>
+          <div>
+            <span>Capture</span>
+            <strong>
+              {source.metadata.ingestion.overlayActions?.length
+                ? `${source.metadata.ingestion.overlayActions.length} cleanup actions`
+                : "No capture actions"}
             </strong>
           </div>
         </>
@@ -583,36 +1094,6 @@ function FragmentPair({ name, value }: { name: string; value: string }) {
   );
 }
 
-function ElementChain({
-  chain,
-  onSelect,
-  selectedId
-}: {
-  chain: ElementSummary[];
-  onSelect: (locatorId: string) => void;
-  selectedId: string;
-}) {
-  return (
-    <div className="subsection">
-      <div className="mini-heading">Element Chain</div>
-      <div className="chain-list">
-        {chain.map((item) => (
-          <button
-            className={item.locatorId === selectedId ? "chain-item selected" : "chain-item"}
-            key={item.locatorId}
-            onClick={() => onSelect(item.locatorId)}
-            type="button"
-          >
-            <span>{item.locatorId}</span>
-            <strong>{item.tagName}</strong>
-            <small>{item.name || item.text || item.attributes.id || "unnamed"}</small>
-          </button>
-        ))}
-      </div>
-    </div>
-  );
-}
-
 function CandidateList({
   candidates,
   selectedId,
@@ -643,11 +1124,92 @@ function CandidateList({
               {candidate.unique ? "Unique" : `${candidate.matchCount} matches`} · score {candidate.score}
             </span>
             {candidate.warnings.length ? (
-              <span className="candidate-warning">{candidate.warnings[0]}</span>
+              <span className="candidate-warning">{candidate.warnings[candidate.warnings.length - 1]}</span>
             ) : null}
             <span className="score-bar" style={{ ["--score" as string]: `${Math.max(8, Math.min(100, candidate.score))}%` }} />
           </button>
         ))}
+      </div>
+    </div>
+  );
+}
+
+function ManualLocatorTester({
+  strategy,
+  value,
+  candidate,
+  snippet,
+  snippetWarning,
+  copied,
+  disabled,
+  matchCount,
+  onStrategyChange,
+  onValueChange,
+  onCopy,
+  onCopySelector
+}: {
+  strategy: ManualStrategy;
+  value: string;
+  candidate: LocatorCandidate | null;
+  snippet: string;
+  snippetWarning?: string;
+  copied: CopyState;
+  disabled: boolean;
+  matchCount: number;
+  onStrategyChange: (strategy: ManualStrategy) => void;
+  onValueChange: (value: string) => void;
+  onCopy: () => void;
+  onCopySelector: () => void;
+}) {
+  return (
+    <div className="subsection snippet-section">
+      <div className="mini-heading">Manual Locator Tester</div>
+      <select value={strategy} onChange={(event) => onStrategyChange(event.target.value as ManualStrategy)} disabled={disabled}>
+        <option value="css">CSS</option>
+        <option value="xpath">XPath</option>
+        <option value="testId">Test ID value</option>
+        <option value="text">Text</option>
+      </select>
+      <input
+        className="url-input"
+        value={value}
+        onChange={(event) => onValueChange(event.target.value)}
+        disabled={disabled}
+        spellCheck={false}
+        placeholder={disabled ? "Import a snapshot first" : "Type a selector or value"}
+        aria-label="Manual locator"
+      />
+      {candidate ? (
+        <div className={candidate.unique ? "manual-result unique" : "manual-result warning"}>
+          <strong>{candidate.unique ? "Unique match" : `${candidate.matchCount} matches`}</strong>
+          <code>{candidate.value}</code>
+          <span>{matchCount ? `${matchCount} preview match${matchCount === 1 ? "" : "es"} highlighted` : "No preview matches highlighted"}</span>
+          {candidate.warnings.length ? <span>{candidate.warnings[candidate.warnings.length - 1]}</span> : null}
+        </div>
+      ) : null}
+      {snippetWarning ? <div className="warning-note">{snippetWarning}</div> : null}
+      {candidate ? <pre className="snippet-code">{snippet}</pre> : null}
+      <div className="copy-action-row">
+        <button
+          className="secondary-button"
+          onClick={onCopySelector}
+          disabled={!candidate}
+          type="button"
+          aria-label="Copy manual selector"
+        >
+          {copied === "manualSelector" ? <Check size={16} /> : <Copy size={16} />}
+          {copied === "manualSelector" ? "Copied" : "Selector"}
+        </button>
+        <button
+          className="primary-button"
+          onClick={onCopy}
+          disabled={!candidate}
+          type="button"
+          aria-label="Copy manual snippet"
+        >
+          {copied === "manualSnippet" ? <Check size={16} /> : <Copy size={16} />}
+          {copied === "manualSnippet" ? "Copied" : "Snippet"}
+        </button>
       </div>
     </div>
   );
@@ -661,16 +1223,20 @@ function SnippetPanel({
   copied,
   onFrameworkChange,
   onModeChange,
-  onCopy
+  onCopy,
+  onCopySelector,
+  onCopyAll
 }: {
   framework: Framework;
   mode: SnippetMode;
   snippet: string;
   warning?: string;
-  copied: boolean;
+  copied: CopyState;
   onFrameworkChange: (framework: Framework) => void;
   onModeChange: (mode: SnippetMode) => void;
   onCopy: () => void;
+  onCopySelector: () => void;
+  onCopyAll: () => void;
 }) {
   return (
     <div className="subsection snippet-section">
@@ -699,12 +1265,72 @@ function SnippetPanel({
 
       {warning ? <div className="warning-note">{warning}</div> : null}
       <pre className="snippet-code">{snippet}</pre>
-      <button className="primary-button full-width" onClick={onCopy} type="button">
-        {copied ? <Check size={16} /> : <Copy size={16} />}
-        {copied ? "Copied" : "Copy snippet"}
-      </button>
+      <div className="copy-action-row">
+        <button className="secondary-button" onClick={onCopySelector} type="button" aria-label="Copy selected selector">
+          {copied === "selector" ? <Check size={16} /> : <Copy size={16} />}
+          {copied === "selector" ? "Copied" : "Selector"}
+        </button>
+        <button className="secondary-button" onClick={onCopyAll} type="button" aria-label="Copy all candidates">
+          {copied === "all" ? <Check size={16} /> : <Copy size={16} />}
+          {copied === "all" ? "Copied" : "All"}
+        </button>
+        <button className="primary-button" onClick={onCopy} type="button" aria-label="Copy selected snippet">
+          {copied === "snippet" ? <Check size={16} /> : <Copy size={16} />}
+          {copied === "snippet" ? "Copied" : "Snippet"}
+        </button>
+      </div>
     </div>
   );
+}
+
+function selectorTextFor(candidate: LocatorCandidate) {
+  if (candidate.strategy === "compound") {
+    const css = candidate.parts?.css ?? candidate.value;
+    const text = candidate.parts?.text;
+    return text ? `${css} hasText ${JSON.stringify(text)}` : css;
+  }
+  return candidate.value;
+}
+
+function matchingLocatorIds(document: Document, candidate: LocatorCandidate): string[] {
+  const elements = matchingElements(document, candidate);
+  return elements
+    .map((element) => element.getAttribute("data-locator-id"))
+    .filter((locatorId): locatorId is string => Boolean(locatorId));
+}
+
+function matchingElements(document: Document, candidate: LocatorCandidate): Element[] {
+  try {
+    if (candidate.strategy === "testId" || candidate.strategy === "css") {
+      return Array.from(document.querySelectorAll(candidate.value));
+    }
+
+    if (candidate.strategy === "xpath") {
+      const result = document.evaluate(candidate.value, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+      return Array.from({ length: result.snapshotLength }, (_, index) => result.snapshotItem(index)).filter(
+        (node): node is Element => Boolean(node && node.nodeType === Node.ELEMENT_NODE)
+      );
+    }
+
+    if (candidate.strategy === "text") {
+      return Array.from(document.body.querySelectorAll("*")).filter((element) => {
+        return normalizeSnapshotText(element.textContent ?? "") === candidate.value;
+      });
+    }
+
+    if (candidate.strategy === "compound") {
+      const css = candidate.parts?.css;
+      const text = candidate.parts?.text;
+      if (!css || !text) return [];
+      return Array.from(document.querySelectorAll(css)).filter((element) => {
+        return normalizeSnapshotText(element.textContent ?? "").includes(text);
+      });
+    }
+  } catch {
+    return [];
+  }
+
+  return [];
 }
 
 function markIframeSelection(locatorId: string) {
@@ -716,6 +1342,26 @@ function markIframeSelection(locatorId: string) {
     element.removeAttribute("data-locator-selected");
   });
   frameDocument.querySelector(`[data-locator-id="${CSS.escape(locatorId)}"]`)?.setAttribute("data-locator-selected", "true");
+}
+
+function markIframeManualMatches(locatorIds: string[]) {
+  const frame = document.querySelector<HTMLIFrameElement>("iframe[title='Snapshot preview']");
+  const frameDocument = frame?.contentDocument;
+  if (!frameDocument) return;
+
+  frameDocument.querySelectorAll("[data-locator-manual-match]").forEach((element) => {
+    element.removeAttribute("data-locator-manual-match");
+  });
+
+  for (const locatorId of locatorIds) {
+    frameDocument
+      .querySelector(`[data-locator-id="${CSS.escape(locatorId)}"]`)
+      ?.setAttribute("data-locator-manual-match", "true");
+  }
+}
+
+function normalizeSnapshotText(value: string) {
+  return value.replace(/\s+/g, " ").trim();
 }
 
 function eventTargetElement(target: EventTarget | null): Element | null {

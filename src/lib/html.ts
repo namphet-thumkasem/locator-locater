@@ -19,7 +19,7 @@ const RESOURCE_ATTRIBUTES = new Set([
   "formaction"
 ]);
 
-const TEST_ID_ATTRIBUTES = ["data-testid", "data-cy", "data-qa", "data-test"];
+export const DEFAULT_TEST_ID_ATTRIBUTES = ["data-testid", "data-test", "data-cy", "data-qa"];
 const SENSITIVE_VALUE_PATTERN = /(password|token|secret|api[-_]?key|auth|session|csrf|credential)/i;
 
 export function parseWorkbenchInput(rawValue: string): ParseResult {
@@ -116,6 +116,8 @@ function isIngestionMetadata(value: unknown): value is NonNullable<RenderedHtmlB
     typeof ingestion.stylesheetsInlined === "number" &&
     typeof ingestion.stylesheetsSkipped === "number" &&
     typeof ingestion.scriptsDetected === "number" &&
+    (ingestion.overlayActions === undefined ||
+      (Array.isArray(ingestion.overlayActions) && ingestion.overlayActions.every((action) => typeof action === "string"))) &&
     Array.isArray(ingestion.warnings) &&
     ingestion.warnings.every((warning) => typeof warning === "string")
   );
@@ -233,6 +235,11 @@ function injectPreviewStyles(document: Document) {
       outline: 2px dashed #d97706 !important;
       outline-offset: 2px !important;
     }
+    [data-locator-manual-match="true"] {
+      outline: 3px solid #2563eb !important;
+      outline-offset: 5px !important;
+      box-shadow: 0 0 0 8px rgba(37, 99, 235, 0.18) !important;
+    }
   `;
   document.head.appendChild(style);
 }
@@ -252,6 +259,18 @@ function isSafeHref(value: string): boolean {
   return !trimmed.startsWith("javascript:") && !trimmed.startsWith("data:");
 }
 
-export function testIdAttributes() {
-  return TEST_ID_ATTRIBUTES;
+export function testIdAttributes(attributes = DEFAULT_TEST_ID_ATTRIBUTES) {
+  return normalizeTestIdAttributes(attributes);
+}
+
+function normalizeTestIdAttributes(attributes: string[]) {
+  const seen = new Set<string>();
+  return attributes
+    .map((attribute) => attribute.trim())
+    .filter((attribute) => /^[a-zA-Z_:][a-zA-Z0-9_:.~-]*$/.test(attribute))
+    .filter((attribute) => {
+      if (seen.has(attribute)) return false;
+      seen.add(attribute);
+      return true;
+    });
 }

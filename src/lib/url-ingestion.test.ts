@@ -14,6 +14,7 @@ describe("URL ingestion", () => {
       html: "<!doctype html><title>Rendered</title><button>Save</button>",
       title: "Rendered",
       url: "https://example.test/dashboard",
+      overlayActions: ["Clicked Accept"],
       viewport: { width: 1440, height: 900 }
     }));
 
@@ -27,9 +28,23 @@ describe("URL ingestion", () => {
       expect(result.bundle.capturedAt).toBeTruthy();
       expect(result.bundle.viewport).toEqual({ width: 1440, height: 900 });
       expect(result.bundle.ingestion?.mode).toBe("rendered-dom");
+      expect(result.bundle.ingestion?.overlayActions).toEqual(["Clicked Accept"]);
       expect(result.bundle.ingestion?.warnings[0]).toContain("executed page JavaScript");
     }
-    expect(renderPage).toHaveBeenCalledWith("https://example.test/dashboard");
+    expect(renderPage).toHaveBeenCalledWith("https://example.test/dashboard", { dismissOverlays: true });
+  });
+
+  it("can render without dismissing overlays when requested", async () => {
+    const renderPage = vi.fn(async () => ({
+      html: "<!doctype html><title>Rendered</title><button>Save</button>",
+      title: "Rendered",
+      url: "https://example.test/dashboard"
+    }));
+
+    const result = await ingestUrl("https://example.test/dashboard", { dismissOverlays: false, renderPage });
+
+    expect(result.ok).toBe(true);
+    expect(renderPage).toHaveBeenCalledWith("https://example.test/dashboard", { dismissOverlays: false });
   });
 
   it("inlines linked stylesheets into rendered HTML bundles", async () => {
@@ -76,6 +91,25 @@ describe("URL ingestion", () => {
       inlined: 0,
       skipped: 1
     });
+  });
+
+  it("removes non-visual payload before enforcing the rendered HTML size limit", async () => {
+    const renderPage = vi.fn(async () => ({
+      html: `<!doctype html><title>Huge App</title><main><button>Apply</button></main><script>${"x".repeat(1_600_000)}</script>`,
+      title: "Huge App",
+      url: "https://example.test/huge-app"
+    }));
+
+    const result = await ingestUrl("https://example.test/huge-app", { renderPage });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.bundle.html).toContain("<button>Apply</button>");
+      expect(result.bundle.html).not.toContain("<script>");
+      expect(result.bundle.ingestion?.scriptsDetected).toBe(1);
+      expect(result.bundle.ingestion?.overlayActions?.join("\n")).toContain("Removed 1 script tag");
+      expect(result.bundle.ingestion?.warnings.join("\n")).toContain("executed during capture and were removed");
+    }
   });
 
   it("keeps source HTML fallback as an explicit helper", async () => {

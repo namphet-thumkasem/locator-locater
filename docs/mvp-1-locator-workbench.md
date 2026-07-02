@@ -259,13 +259,13 @@ Before moving into MVP-2, harden:
 
 ## Future MVP-2
 
-MVP-2 introduces the catalog:
+MVP-2 continues the lightweight locator extraction workflow rather than introducing the catalog. It is tracked in `docs/mvp-2-lightweight-locator-workbench.md`.
 
-- Project and page storage.
-- Page keys and element keys with uniqueness rules.
-- Saved locator candidate sets and preferred locator candidates.
-- IndexedDB persistence.
-- Revalidation and needs-review status.
-- Manual locator candidates.
-- Project-level test id attribute configuration.
-- Project JSON import/export including page snapshots.
+MVP-2 adds:
+
+- Editable test id attribute settings for candidate generation.
+- A temporary manual locator tester for CSS, XPath, test id, and text selectors.
+- Better copy-focused workflows around generated and manual locators.
+- Lightweight local restore of the current workbench input and settings.
+
+The catalog direction is deferred until there is a proven need for durable project/page/element collections.

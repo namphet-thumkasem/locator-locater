@@ -1,4 +1,5 @@
 import type { RenderedHtmlBundle } from "./types";
+import type { Page } from "playwright";
 
 const MAX_HTML_BYTES = 1_500_000;
 const MAX_STYLESHEET_BYTES = 500_000;
@@ -6,6 +7,7 @@ const MAX_STYLESHEETS = 8;
 const FETCH_TIMEOUT_MS = 12_000;
 const RENDER_TIMEOUT_MS = 18_000;
 const RENDER_SETTLE_MS = 1_000;
+const OVERLAY_SETTLE_MS = 600;
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 type StylesheetInliningResult = {
@@ -13,17 +15,26 @@ type StylesheetInliningResult = {
   inlined: number;
   skipped: number;
 };
+type CaptureHtmlCompactionResult = {
+  html: string;
+  actions: string[];
+};
 type RenderedPage = {
   html: string;
   url: string;
   title?: string;
+  overlayActions?: string[];
   viewport?: {
     width?: number;
     height?: number;
   };
 };
-type RenderPage = (url: string) => Promise<RenderedPage>;
+type RenderPageOptions = {
+  dismissOverlays: boolean;
+};
+type RenderPage = (url: string, options: RenderPageOptions) => Promise<RenderedPage>;
 type IngestUrlOptions = {
+  dismissOverlays?: boolean;
   fetchLike?: FetchLike;
   renderPage?: RenderPage;
 };
@@ -38,23 +49,30 @@ export async function ingestUrl(
 ): Promise<UrlIngestionResult> {
   const fetchLike = typeof optionsOrFetchLike === "function" ? optionsOrFetchLike : (optionsOrFetchLike.fetchLike ?? fetch);
   const renderPage = typeof optionsOrFetchLike === "function" ? renderUrlWithBrowser : (optionsOrFetchLike.renderPage ?? renderUrlWithBrowser);
+  const dismissOverlays = typeof optionsOrFetchLike === "function" ? true : (optionsOrFetchLike.dismissOverlays ?? true);
   const normalized = normalizeHttpUrl(rawUrl);
   if (!normalized) {
     return { ok: false, status: 400, message: "Enter a valid http or https URL." };
   }
 
   try {
-    const rendered = await renderPage(normalized);
-    if (byteLength(rendered.html) > MAX_HTML_BYTES) {
+    const rendered = await renderPage(normalized, { dismissOverlays });
+    const scriptsDetected = countExecutableScripts(rendered.html);
+    const compacted = compactRenderedHtml(rendered.html);
+    const captureActions = [...(rendered.overlayActions ?? []), ...compacted.actions];
+
+    if (byteLength(compacted.html) > MAX_HTML_BYTES) {
       return { ok: false, status: 413, message: "Fetched page is too large for the workbench." };
     }
 
-    if (!rendered.html.trim()) {
+    if (!compacted.html.trim()) {
       return { ok: false, status: 422, message: "Fetched page was empty." };
     }
 
-    const stylesheetResult = await inlineStylesheets(rendered.html, rendered.url || normalized, fetchLike);
-    const scriptsDetected = countExecutableScripts(rendered.html);
+    const stylesheetResult = await inlineStylesheets(compacted.html, rendered.url || normalized, fetchLike);
+    if (byteLength(stylesheetResult.html) > MAX_HTML_BYTES) {
+      return { ok: false, status: 413, message: "Fetched page is too large for the workbench after inlining stylesheets." };
+    }
 
     return {
       ok: true,
@@ -69,7 +87,8 @@ export async function ingestUrl(
           stylesheetsInlined: stylesheetResult.inlined,
           stylesheetsSkipped: stylesheetResult.skipped,
           scriptsDetected,
-          warnings: ingestionWarnings(stylesheetResult, scriptsDetected)
+          overlayActions: captureActions,
+          warnings: ingestionWarnings(stylesheetResult, scriptsDetected, captureActions)
         }
       }
     };
@@ -259,7 +278,47 @@ function countExecutableScripts(html: string): number {
   return Array.from(html.matchAll(/<script\b/gi)).length;
 }
 
-function ingestionWarnings(stylesheets: StylesheetInliningResult, scriptsDetected: number): string[] {
+function compactRenderedHtml(html: string): CaptureHtmlCompactionResult {
+  let nextHtml = html;
+  const actions: string[] = [];
+
+  const replacements: Array<{ label: string; pattern: RegExp; replacement: string }> = [
+    { label: "script tag", pattern: /<script\b[\s\S]*?<\/script>/gi, replacement: "" },
+    { label: "noscript tag", pattern: /<noscript\b[\s\S]*?<\/noscript>/gi, replacement: "" },
+    { label: "template tag", pattern: /<template\b[\s\S]*?<\/template>/gi, replacement: "" },
+    { label: "HTML comment", pattern: /<!--[\s\S]*?-->/g, replacement: "" },
+    {
+      label: "preload link",
+      pattern: /<link\b(?=[^>]*\brel\s*=\s*(?:"[^"]*(?:preload|prefetch|modulepreload|preconnect|dns-prefetch|icon)[^"]*"|'[^']*(?:preload|prefetch|modulepreload|preconnect|dns-prefetch|icon)[^']*'|[^\s>]*(?:preload|prefetch|modulepreload|preconnect|dns-prefetch|icon)[^\s>]*))[^>]*>/gi,
+      replacement: ""
+    }
+  ];
+
+  for (const { label, pattern, replacement } of replacements) {
+    let count = 0;
+    nextHtml = nextHtml.replace(pattern, () => {
+      count += 1;
+      return replacement;
+    });
+    if (count > 0) actions.push(`Removed ${count} ${label}${count === 1 ? "" : "s"} from captured HTML`);
+  }
+
+  let dataResourceCount = 0;
+  nextHtml = nextHtml.replace(
+    /\s(src|srcset|poster)\s*=\s*("data:[^"]{1024,}"|'data:[^']{1024,}'|data:[^\s>]{1024,})/gi,
+    () => {
+      dataResourceCount += 1;
+      return "";
+    }
+  );
+  if (dataResourceCount > 0) {
+    actions.push(`Removed ${dataResourceCount} large data resource attribute${dataResourceCount === 1 ? "" : "s"} from captured HTML`);
+  }
+
+  return { html: nextHtml, actions };
+}
+
+function ingestionWarnings(stylesheets: StylesheetInliningResult, scriptsDetected: number, overlayActions: string[] = []): string[] {
   const warnings = ["URL capture executed page JavaScript in Chromium, then froze the rendered DOM for sandbox preview."];
 
   if (stylesheets.skipped > 0) {
@@ -267,7 +326,11 @@ function ingestionWarnings(stylesheets: StylesheetInliningResult, scriptsDetecte
   }
 
   if (scriptsDetected > 0) {
-    warnings.push(`${scriptsDetected} script tag${scriptsDetected === 1 ? "" : "s"} remain in captured HTML and will be stripped from the sandbox preview.`);
+    warnings.push(`${scriptsDetected} script tag${scriptsDetected === 1 ? "" : "s"} executed during capture and were removed before sandbox preview.`);
+  }
+
+  if (overlayActions.length > 0) {
+    warnings.push(`Capture applied ${overlayActions.length} cleanup action${overlayActions.length === 1 ? "" : "s"} before freezing the DOM.`);
   }
 
   return warnings;
@@ -284,7 +347,7 @@ function sourceHtmlWarnings(stylesheets: StylesheetInliningResult, scriptsDetect
   return warnings;
 }
 
-async function renderUrlWithBrowser(url: string): Promise<RenderedPage> {
+async function renderUrlWithBrowser(url: string, options: RenderPageOptions): Promise<RenderedPage> {
   const { chromium } = await import("playwright");
   const browser = await chromium.launch({ headless: true });
 
@@ -298,16 +361,160 @@ async function renderUrlWithBrowser(url: string): Promise<RenderedPage> {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: RENDER_TIMEOUT_MS });
     await page.waitForLoadState("networkidle", { timeout: 4_000 }).catch(() => undefined);
     await page.waitForTimeout(RENDER_SETTLE_MS);
+    const overlayActions = options.dismissOverlays ? await dismissBlockingOverlays(page) : [];
+    await page.evaluate(() => {
+      document.querySelectorAll("[data-locator-capture-action]").forEach((element) => {
+        element.removeAttribute("data-locator-capture-action");
+      });
+    }).catch(() => undefined);
 
     return {
       html: await page.content(),
       url: page.url(),
       title: await page.title(),
+      overlayActions,
       viewport
     };
   } finally {
     await browser.close();
   }
+}
+
+async function dismissBlockingOverlays(page: Page): Promise<string[]> {
+  const actions: string[] = [];
+
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const action = await page.evaluate((actionIndex) => {
+      const dismissTextPattern =
+        /(accept all|accept|agree|allow all|got it|ok|close|dismiss|continue|ยอมรับ|ตกลง|ปิด|รับทราบ|อนุญาต)/i;
+      const controls = Array.from(
+        document.querySelectorAll<HTMLElement>(
+          [
+            "button",
+            "a[href]",
+            "input[type='button']",
+            "input[type='submit']",
+            "[role='button']",
+            "[aria-label]"
+          ].join(",")
+        )
+      );
+
+      const visibleControls = controls
+        .map((element) => {
+          const rect = element.getBoundingClientRect();
+          const style = window.getComputedStyle(element);
+          const text = [
+            element.innerText,
+            element.textContent,
+            element.getAttribute("aria-label"),
+            element.getAttribute("title"),
+            element.getAttribute("value")
+          ]
+            .filter(Boolean)
+            .join(" ")
+            .replace(/\s+/g, " ")
+            .trim();
+          return { element, rect, style, text };
+        })
+        .filter(({ rect, style }) => {
+          return rect.width > 4 && rect.height > 4 && style.visibility !== "hidden" && style.display !== "none" && Number(style.opacity || "1") > 0.05;
+        });
+
+      const ranked = visibleControls
+        .map((item) => {
+          const fixedAncestor = closestBlockingAncestor(item.element);
+          const isDismissText = dismissTextPattern.test(item.text);
+          const rect = fixedAncestor?.getBoundingClientRect() ?? item.rect;
+          const areaRatio = (rect.width * rect.height) / Math.max(1, window.innerWidth * window.innerHeight);
+          let score = 0;
+          if (isDismissText) score += 30;
+          if (fixedAncestor) score += 20;
+          if (areaRatio > 0.12) score += 10;
+          if (/accept all|ยอมรับ|ตกลง/i.test(item.text)) score += 6;
+          if (/close|dismiss|ปิด/i.test(item.text)) score += 4;
+          return { ...item, score };
+        })
+        .filter((item) => item.score >= 30)
+        .sort((a, b) => b.score - a.score || b.rect.width * b.rect.height - a.rect.width * a.rect.height);
+
+      const target = ranked[0]?.element;
+      if (!target) return null;
+      const marker = `dismiss-${actionIndex}`;
+      target.setAttribute("data-locator-capture-action", marker);
+      return {
+        marker,
+        text: ranked[0].text.slice(0, 80) || target.tagName.toLowerCase()
+      };
+
+      function closestBlockingAncestor(element: HTMLElement): HTMLElement | null {
+        let current: HTMLElement | null = element;
+        while (current && current !== document.body) {
+          const rect = current.getBoundingClientRect();
+          const style = window.getComputedStyle(current);
+          const position = style.position;
+          const areaRatio = (rect.width * rect.height) / Math.max(1, window.innerWidth * window.innerHeight);
+          const blocksPage = (position === "fixed" || position === "sticky") && areaRatio > 0.08;
+          const highLayer = Number(style.zIndex || "0") >= 10;
+          if (blocksPage || highLayer) return current;
+          current = current.parentElement;
+        }
+        return null;
+      }
+    }, attempt);
+
+    if (!action) break;
+
+    await page.locator(`[data-locator-capture-action="${action.marker}"]`).click({ timeout: 1_500 }).catch(() => undefined);
+    actions.push(`Clicked ${action.text}`);
+    await page.waitForLoadState("networkidle", { timeout: 2_000 }).catch(() => undefined);
+    await page.waitForTimeout(OVERLAY_SETTLE_MS);
+  }
+
+  const hiddenLoaders = await page.evaluate(() => {
+    let hidden = 0;
+    const loadingPattern = /(preload|preloader|loading|loader|spinner|กำลังโหลด)/i;
+    const viewportArea = Math.max(1, window.innerWidth * window.innerHeight);
+
+    for (const element of Array.from(document.body.querySelectorAll<HTMLElement>("body *"))) {
+      const rect = element.getBoundingClientRect();
+      if (rect.width < 24 || rect.height < 24) continue;
+      const style = window.getComputedStyle(element);
+      if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity || "1") <= 0.05) continue;
+
+      const areaRatio = (rect.width * rect.height) / viewportArea;
+      const hasBlockingPosition = style.position === "fixed" || style.position === "sticky";
+      if (!hasBlockingPosition && areaRatio < 0.45) continue;
+
+      const signature = [
+        element.id,
+        element.className,
+        element.getAttribute("aria-label"),
+        element.getAttribute("role"),
+        element.textContent,
+        Array.from(element.querySelectorAll("img")).map((image) => `${image.alt} ${image.getAttribute("src")}`).join(" ")
+      ]
+        .join(" ")
+        .replace(/\s+/g, " ");
+
+      const hasDismissControl = Boolean(element.querySelector("button, a[href], [role='button'], input[type='button'], input[type='submit']"));
+      if (!loadingPattern.test(signature) || hasDismissControl) continue;
+
+      element.setAttribute("data-locator-stale-loading-hidden", "true");
+      element.style.setProperty("display", "none", "important");
+      hidden += 1;
+      break;
+    }
+
+    return hidden;
+  }).catch(() => 0);
+
+  if (hiddenLoaders > 0) {
+    actions.push(`Hid ${hiddenLoaders} stale loading mask${hiddenLoaders === 1 ? "" : "s"}`);
+    await page.waitForTimeout(OVERLAY_SETTLE_MS);
+  }
+
+  return actions;
 }
 
 function renderErrorMessage(error: unknown): string {

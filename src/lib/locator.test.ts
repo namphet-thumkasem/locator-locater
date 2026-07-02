@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { bookmarkletCode, formatSnippet } from "./formatters";
 import { createPageSnapshot, documentFromSnapshot } from "./html";
-import { findByLocatorId, generateLocatorCandidates, summarizeElement } from "./locator";
+import { findByLocatorId, generateLocatorCandidates, manualLocatorCandidate, summarizeElement } from "./locator";
 
 describe("locator candidates", () => {
   it("recommends the best unique candidate for a selected action target", () => {
@@ -36,6 +36,57 @@ describe("locator candidates", () => {
 
     expect(recommended?.strategy).toBe("testId");
     expect(recommended?.value).toBe('[data-qa="save-order"]');
+  });
+
+  it("uses configured test id attributes for lightweight workbench settings", () => {
+    const snapshot = createPageSnapshot(`
+      <main>
+        <button data-pw="create-order">Create order</button>
+      </main>
+    `);
+    const document = documentFromSnapshot(snapshot.html);
+    const target = document.querySelector("button")!;
+    const candidates = generateLocatorCandidates(document, target, { testIdAttributes: ["data-pw"] });
+    const recommended = candidates.find((candidate) => candidate.recommended);
+
+    expect(recommended?.strategy).toBe("testId");
+    expect(recommended?.value).toBe('[data-pw="create-order"]');
+  });
+
+  it("validates temporary manual locator tester candidates without saving them", () => {
+    const snapshot = createPageSnapshot(`
+      <main>
+        <button class="primary">Save</button>
+        <button>Cancel</button>
+      </main>
+    `);
+    const document = documentFromSnapshot(snapshot.html);
+    const uniqueManual = manualLocatorCandidate(document, "css", "button.primary");
+    const broadManual = manualLocatorCandidate(document, "css", "button");
+
+    expect(uniqueManual.unique).toBe(true);
+    expect(uniqueManual.matchCount).toBe(1);
+    expect(broadManual.unique).toBe(false);
+    expect(broadManual.matchCount).toBe(2);
+    expect(broadManual.warnings).toContain("Manual locator is not unique in the page snapshot.");
+  });
+
+  it("parses copied compound CSS selectors in the manual locator tester", () => {
+    const snapshot = createPageSnapshot(`
+      <main>
+        <div class="MuiBox-root css-dq5rxc">รวมแบรนด์เด็ด</div>
+        <div class="MuiBox-root css-dq5rxc">สินค้าแนะนำ</div>
+      </main>
+    `);
+    const document = documentFromSnapshot(snapshot.html);
+    const manual = manualLocatorCandidate(document, "css", 'div.MuiBox-root.css-dq5rxc hasText "รวมแบรนด์เด็ด"');
+    const snippet = formatSnippet(manual, [manual], "playwright", "locator", null);
+
+    expect(manual.strategy).toBe("compound");
+    expect(manual.unique).toBe(true);
+    expect(manual.matchCount).toBe(1);
+    expect(manual.parts).toMatchObject({ css: "div.MuiBox-root.css-dq5rxc", text: "รวมแบรนด์เด็ด" });
+    expect(snippet.code).toBe('page.locator("div.MuiBox-root.css-dq5rxc", { hasText: "รวมแบรนด์เด็ด" })');
   });
 
   it("uses static ids but skips generated-looking ids", () => {
@@ -288,6 +339,27 @@ describe("locator candidates", () => {
 
     expect(css?.unique).toBe(true);
     expect(css?.value).toBe('form.search-form input[name="q"]');
+  });
+
+  it("does not use placeholder or accessible label text as CSS locator attributes", () => {
+    const snapshot = createPageSnapshot(`
+      <main>
+        <form class="search-form">
+          <input aria-label="Search jobs" placeholder="Job title or company" />
+        </form>
+      </main>
+    `);
+    const document = documentFromSnapshot(snapshot.html);
+    const target = document.querySelector("input")!;
+    const candidates = generateLocatorCandidates(document, target);
+    const cssCandidates = candidates.filter((candidate) => candidate.strategy === "css");
+    const labelCandidate = candidates.find((candidate) => candidate.strategy === "label");
+
+    expect(labelCandidate?.value).toBe("Search jobs");
+    expect(cssCandidates.some((candidate) => candidate.value.includes("placeholder"))).toBe(false);
+    expect(cssCandidates.some((candidate) => candidate.value.includes("aria-label"))).toBe(false);
+    expect(cssCandidates.some((candidate) => candidate.value.includes("Search jobs"))).toBe(false);
+    expect(cssCandidates.some((candidate) => candidate.value.includes("Job title or company"))).toBe(false);
   });
 
   it("promotes a CSS plus text compound locator when single-strategy candidates are ambiguous", () => {

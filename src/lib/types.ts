@@ -14,6 +14,7 @@ export type RenderedHtmlBundle = {
     stylesheetsInlined: number;
     stylesheetsSkipped: number;
     scriptsDetected: number;
+    overlayActions?: string[];
     warnings: string[];
   };
 };
